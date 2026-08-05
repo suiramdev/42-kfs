@@ -5,6 +5,11 @@ Rust kernel, a custom linker script, packaged as a GRUB rescue ISO.
 
 Screen output ("42") is not part of this bring-up — see [docs/VGA.md](docs/VGA.md).
 
+**Documentation:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how
+every piece works, [docs/GLOSSARY.md](docs/GLOSSARY.md) defines every technical
+term used, and [docs/](docs/) indexes both. This file is just build and run
+instructions.
+
 ## Layout
 
 ```
