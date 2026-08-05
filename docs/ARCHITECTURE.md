@@ -1,84 +1,115 @@
 # How kfs-1 works
 
-This document explains every piece of the current kernel: what exists, what
-each file contributes, and what the machine actually does between power-on and
-the kernel's idle loop. Unfamiliar words are defined in
-[GLOSSARY.md](GLOSSARY.md).
+Written for a programmer who is comfortable in C, C++, Python or TypeScript and
+has never touched assembly, a kernel, or a bootloader. Unfamiliar words are
+defined in [GLOSSARY.md](GLOSSARY.md).
 
-Everything below is measured from the artifacts this repo builds, not
-idealised: addresses, sizes and byte values come from `objdump`/`readelf` on
-`build/kernel.bin` and from the QEMU monitor on a running guest.
+Every address, byte value and size below was measured from the artifacts this
+repo builds, with `objdump`, `readelf` and the QEMU monitor. Nothing here is
+idealised.
 
-## 1. Status
+## 1. The one idea you need first
 
-Implemented:
+Every program you have ever written ran **on top of** an operating system.
+`printf`, `malloc`, `open`, `Promise`, `import` — all of those are requests to a
+kernel. This project is the thing that would have answered them.
 
-- A multiboot-compliant boot stub in assembly that sets up a stack and calls
-  into Rust.
+So take away everything the OS was doing for you:
+
+| You are used to | Here |
+|---|---|
+| The loader picks addresses for your code | You write the addresses out by hand |
+| `main` starts with a working stack | The stack pointer holds garbage until you set it |
+| `printf` prints | Nothing prints. There is no console, only a grid of memory the screen happens to read |
+| `malloc` gives you memory | There is no heap. Nobody wrote one yet |
+| A segfault kills your process | Nobody kills anything. The machine reboots |
+| Threads, files, sockets | None of it exists |
+
+That last row is why the code is so small: there is nothing to call.
+
+## 2. What exists today
+
+Working:
+
+- An assembly boot stub that sets up a stack and calls into Rust.
 - A `no_std` Rust kernel whose entry point is `kmain`, plus the panic handler
-  the language requires.
-- A custom bare-metal compilation target (32-bit x86, no floating-point
-  hardware, no operating system underneath).
-- A linker script that places the kernel at 1 MiB with the multiboot header
-  first.
-- A bootable GRUB ISO image, 5 083 136 bytes (the subject's limit is 10 MiB).
-- A `make check` target that proves the kernel is really executing.
+  the language demands.
+- A custom compilation target: 32-bit x86, no floating-point hardware, no OS
+  underneath.
+- A linker script placing the kernel at 1 MiB with the multiboot header first.
+- A bootable GRUB ISO, 5 083 136 bytes (the subject's limit is 10 MiB).
+- `make check`, which proves the kernel is really executing.
 
-Not implemented yet, deliberately:
+Deliberately absent:
 
-- **Screen output.** `kmain` does nothing but idle. The subject's mandatory
+- **Screen output.** `kmain` idles and nothing else. The subject's mandatory
   "display 42" is designed in [VGA.md](VGA.md) and delivered separately.
-- Interrupt handling (IDT), segmentation setup (GDT), paging, keyboard,
-  serial port, memory allocator, user space. None of it is needed to boot.
+- Interrupt handling, our own segment table, paging, keyboard, serial port, a
+  memory allocator, user space. None of it is needed to boot.
 
-## 2. The chain of custody, power-on to `kmain`
+## 3. Power-on to `kmain`
+
+A **bootloader** is a small program whose only job is to find a kernel, load it
+into memory, and jump to it. We use GRUB, the standard Linux one, because
+writing your own means talking to disk controllers in 16-bit mode.
 
 ```mermaid
 graph TD
-    A[CPU powers on in real mode] --> B[BIOS runs POST, picks a boot device]
-    B --> C[Reads first sector of the ISO<br/>GRUB stage 1]
-    C --> D[GRUB loads its own core + modules from the ISO]
+    A[Power on: CPU in 16-bit real mode] --> B[BIOS: self-test, pick a boot device]
+    B --> C[Reads the first sector of the ISO: GRUB stage 1]
+    C --> D[GRUB loads its own core and modules from the ISO]
     D --> E[GRUB reads /boot/grub/grub.cfg]
     E --> F[menuentry kfs-1: multiboot /boot/kernel.bin]
-    F --> G[GRUB scans the first 8 KiB of kernel.bin<br/>for the multiboot magic 0x1BADB002]
-    G --> H[Switches CPU to 32-bit protected mode,<br/>copies segments to their load addresses]
+    F --> G[GRUB scans the first 8 KiB of kernel.bin<br/>for the magic number 0x1BADB002]
+    G --> H[Switches the CPU to 32-bit protected mode,<br/>copies our code to its load address]
     H --> I[Jumps to the ELF entry point 0x100010 = _start]
     I --> J[_start: mov esp, 0x104040]
     J --> K[call kmain]
-    K --> L[kmain: pause then jmp, idles forever]
+    K --> L[kmain: pause, then jmp back. Idles forever]
 ```
 
-Three things in that chain are ours: the multiboot header GRUB looks for, the
-`grub.cfg` line that names our binary, and `_start`. Everything before them is
-firmware and GRUB doing their standard jobs.
+Only three links in that chain are ours: the magic number GRUB looks for, the
+`grub.cfg` line naming our binary, and `_start`. Everything before them is
+firmware and GRUB doing their ordinary jobs.
 
-### Why the handoff needs a stack first
+### The handshake with GRUB
 
-GRUB jumps to `_start` with the CPU in 32-bit protected mode, interrupts
-disabled, and `esp` **undefined**. A `call` instruction pushes a return address
-onto the stack, so calling any function before pointing `esp` at real memory
-would corrupt whatever `esp` happened to contain. Hence the two instructions in
-`_start`: set the stack, then call.
+GRUB will not load an arbitrary file. It follows a published contract called
+**multiboot**: put a recognisable 12-byte header near the front of your binary
+and any compliant bootloader will load you and hand over a CPU already in
+32-bit mode. Find the header, load and jump. Miss it, refuse the file. That is
+the whole agreement, and our half of it is fourteen lines of `boot/boot.asm`.
 
-That is the entire purpose of the assembly file. Rust cannot express "the
-stack pointer does not exist yet".
+### Why the stack has to come first
 
-## 3. File by file
+GRUB jumps to `_start` with interrupts off and the stack pointer register `esp`
+holding **whatever was left in it** — an address that means nothing.
 
-### `boot/boot.asm` — the boot stub
+A function call pushes its return address onto the stack. That is true in C, in
+Rust, in every compiled language. So calling *anything* before `esp` points at
+real memory writes a return address into a random location and corrupts it.
 
-Assembled by NASM into a 32-bit ELF object file: `nasm -f elf32` → 928 bytes of
-`build/boot.o`.
+And you cannot fix this in Rust, because Rust code needs a working stack in
+order to run at all. "The stack does not exist yet" is not a state Rust can
+express. That single problem is the entire reason there is an assembly file in
+this repo.
 
-It contributes three sections:
+## 4. The five files that are the project
 
-| Section | Size | Contents |
+Everything else is documentation or build plumbing.
+
+### `boot/boot.asm` — fourteen bytes of assembly
+
+Assembly is one CPU instruction per line and no abstractions at all. NASM turns
+this file into a 928-byte 32-bit object file. It contributes three pieces:
+
+| Section | Size | What it is |
 |---|---|---|
 | `.multiboot` | 12 B | the header GRUB searches for |
-| `.text` | 14 B | `_start` and the hang loop |
-| `.bss` | 16 KiB | the kernel stack, reserved but not stored in the file |
+| `.text` | 14 B | `_start` and a hang loop |
+| `.bss` | 16 KiB | the kernel stack |
 
-**The multiboot header** is three 32-bit words:
+**The header** is three 32-bit numbers:
 
 ```nasm
 MAGIC    equ 0x1BADB002          ; fixed value the spec mandates
@@ -86,24 +117,22 @@ FLAGS    equ MBALIGN | MEMINFO   ; 1<<0 | 1<<1 = 3
 CHECKSUM equ -(MAGIC + FLAGS)    ; = 0xE4524FFB
 ```
 
-`MAGIC + FLAGS + CHECKSUM` must wrap to zero in 32-bit arithmetic; that is the
-whole validity test. `0x1BADB002 + 3 + 0xE4524FFB = 0x100000000`, which
-truncates to 0. GRUB only searches the first 8 KiB of the file, which is why
-the linker script puts this section first. Verified in the final binary:
+The validity test is one line of arithmetic: the three must add up to zero in
+32-bit maths. `0x1BADB002 + 3 + 0xE4524FFB = 0x100000000`, which overflows to
+0. Here it is in the finished binary:
 
 ```
 Contents of section .multiboot:
  100000 02b0ad1b 03000000 fb4f52e4
 ```
 
-Little-endian, so those bytes read back as `0x1BADB002`, `0x00000003`,
-`0xE4524FFB`. `make` also asserts it independently with
-`grub-file --is-x86-multiboot build/kernel.bin`.
+x86 stores numbers least-significant byte first, so those bytes read back as
+`0x1BADB002`, `0x00000003`, `0xE4524FFB`. The build also checks this
+independently with `grub-file --is-x86-multiboot build/kernel.bin`.
 
-The two flags request that GRUB page-align any modules it loads (`MBALIGN`) and
-pass a memory map in the multiboot info structure (`MEMINFO`). We ignore that
-information today — it costs nothing to ask for and a later step (a physical
-memory allocator) will need it.
+The two flags ask GRUB to page-align any modules it loads and to pass us a map
+of physical memory. We ignore the map today; asking costs nothing and a future
+memory allocator will want it.
 
 **The stack** is 16 KiB of `.bss`:
 
@@ -115,12 +144,12 @@ stack_bottom:
 stack_top:
 ```
 
-`resb` reserves bytes without putting them in the file — `.bss` is zeroed
-memory, so storing 16 KiB of zeros on disk would be waste. x86 stacks grow
-*downwards*, so the initial `esp` is `stack_top`, the higher address. `align 16`
-satisfies the ABI's stack alignment expectation.
+`resb` means "reserve these bytes, do not store them in the file" — `.bss` is
+memory the loader is told to hand over as zeros. Closer to `calloc` than to a
+literal array of 16 384 zeros compiled into the binary. x86 stacks grow
+*downwards*, so the starting `esp` is `stack_top`, the **higher** address.
 
-**`_start`** is the ELF entry point:
+**`_start`** is where GRUB jumps. Disassembled from the real binary:
 
 ```
 00100010 <_start>:
@@ -133,25 +162,21 @@ satisfies the ABI's stack alignment expectation.
   10001c: eb fc             jmp  10001a
 ```
 
-`0x104040` is `stack_top` resolved by the linker: `stack_bottom` at `0x100040`
-plus `0x4000` (16 384). The hang loop after the `call` is unreachable while
-`kmain` is `-> !`, but it is the correct thing to have there: `cli` disables
-interrupts, `hlt` halts the CPU until the next one, and the `jmp` re-halts if
-some non-maskable event wakes it. Halting is not the same as spinning — `hlt`
-lets the physical CPU idle instead of burning a core.
+`0x104040` is `stack_top` after the linker resolved it: `stack_bottom` at
+`0x100040` plus 16 384. The hang loop below the `call` is unreachable while
+`kmain` never returns, but it is the right thing to have there: `cli` switches
+interrupts off, `hlt` stops the CPU until one arrives anyway, and the `jmp`
+re-halts if something wakes it. Halting is not spinning — `hlt` lets a physical
+CPU idle instead of burning a core at 100%.
 
-`extern kmain` tells NASM the symbol lives elsewhere; the linker resolves it.
-`global _start` exports the symbol so the linker script's `ENTRY(_start)` can
-find it.
+`global _start` exports the name so the linker can find it. `extern kmain`
+promises the name exists somewhere else; the linker fills in the address.
 
-The trailing `section .note.GNU-stack noalloc noexec nowrite progbits` is an
-empty marker section. Modern `ld` warns "missing .note.GNU-stack section
-implies executable stack" without it. Cosmetic, but a clean build is worth two
-lines.
+The trailing `.note.GNU-stack` line is an empty marker section. Without it,
+modern `ld` warns that the stack might be executable. Cosmetic, two lines,
+silent build.
 
-### `kernel/` — the Rust kernel
-
-`kernel/src/lib.rs` is 20 lines and contains exactly two items:
+### `kernel/src/lib.rs` — the kernel, all 20 lines
 
 ```rust
 #![no_std]
@@ -167,86 +192,34 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 ```
 
-- `#![no_std]` drops the standard library. `std` assumes an operating system —
-  files, threads, heap, syscalls — none of which exist here. We keep `core`:
-  the OS-independent half of the language (integers, slices, `Option`, atomics,
-  `PanicInfo`).
-- `#[no_mangle]` keeps the symbol literally named `kmain` rather than a mangled
-  one. The assembler wrote `call kmain`, so the symbol must match exactly. For
-  comparison, the panic handler is mangled and shows up in the symbol table as
-  `_RNvCsj5li9sZI3iI_7___rustc17rust_begin_unwind`.
-- `extern "C"` selects the C calling convention rather than Rust's unspecified
-  one, so assembly and Rust agree on how a call works.
-- `-> !` means "never returns". That is a promise to the compiler; it is why the
-  function must end in an infinite loop and why nothing after `call kmain` can
-  run.
-- `core::hint::spin_loop()` emits the x86 `pause` instruction (`f3 90`). It is a
-  hint to the processor that this is a spin-wait: it saves power and avoids a
-  pipeline penalty. The whole function compiles to four bytes:
+Read against what you already know:
 
-  ```
-  00100030 <kmain>:
-    100030: f3 90     pause
-    100032: eb fc     jmp 100030
-  ```
+| Written here | What it means |
+|---|---|
+| `#![no_std]` | Drop Rust's standard library; it assumes an OS. Keep `core`: integers, slices, `Option`, no I/O, no heap. In C terms: `-ffreestanding`, no libc. |
+| `#[no_mangle]` | `extern "C"` in C++. Keep the symbol named literally `kmain`, because the assembly file wrote `call kmain`. |
+| `extern "C"` | Use the C calling convention, so assembly and Rust agree on what a call looks like. |
+| `-> !` | "Never returns." A promise to the compiler, and the reason the body must be an infinite loop. |
+| `#[panic_handler]` | Mandatory without `std`. A panic normally aborts the *process*; there are no processes. You must say where panics go. Ours spins forever. |
 
-- `#[panic_handler]` is mandatory in `no_std`: the language needs somewhere to
-  go when a panic happens, and there is no runtime to unwind into. Ours halts.
-  In the binary it sits at `0x100020`, under the mangled name above.
+`core::hint::spin_loop()` emits the x86 `pause` instruction — a hint that this
+loop is waiting on something, which saves power and avoids a pipeline penalty.
+The whole function is four bytes:
 
-Supporting files:
+```
+00100030 <kmain>:
+  100030: f3 90     pause
+  100032: eb fc     jmp 100030
+```
 
-- `Cargo.toml` — `crate-type = ["staticlib"]` makes `cargo` emit
-  `libkernel.a` (752 190 bytes), an archive of object files that our own `ld`
-  invocation consumes. `panic = "abort"` in both profiles removes unwinding
-  machinery, which would otherwise want a runtime we do not have.
-- `rust-toolchain.toml` — pins `nightly` and the `rust-src` component. Nightly
-  is required because building `core` from source for a custom target is an
-  unstable feature. `rustup` reads this file automatically, so no manual
-  toolchain juggling.
-- `.cargo/config.toml`:
+For contrast with `#[no_mangle]`: the panic handler *is* mangled, and appears in
+the symbol table at `0x100020` as
+`_RNvCsj5li9sZI3iI_7___rustc17rust_begin_unwind`.
 
-  ```toml
-  [build]
-  target = "i686-kfs.json"
+### `linker.ld` — where the code lands in RAM
 
-  [unstable]
-  json-target-spec = true
-  build-std = ["core", "compiler_builtins"]
-  build-std-features = ["compiler-builtins-mem"]
-  ```
-
-  `build-std` compiles `core` and `compiler_builtins` from source for our
-  target — no precompiled standard library exists for a target we invented.
-  `compiler-builtins-mem` provides `memcpy`, `memset`, `memcmp` and friends in
-  Rust; LLVM emits calls to those symbols for struct copies and slice
-  operations, and normally libc supplies them. We have no libc.
-  `json-target-spec` is the flag that permits `.json` target files at all on
-  current nightly.
-
-- `i686-kfs.json` — the custom target definition. Every field earns its place:
-
-  | Field | Why |
-  |---|---|
-  | `"llvm-target": "i686-unknown-none"` | 32-bit x86, no OS |
-  | `"data-layout"` | LLVM's type sizes/alignments for i686; must match the LLVM target |
-  | `"arch": "x86"`, `"target-pointer-width": 32` | 32-bit pointers |
-  | `"cpu": "pentium4"` | baseline instruction set to compile for |
-  | `"os": "none"` | freestanding: no syscalls, no libc assumptions |
-  | `"panic-strategy": "abort"` | matches `Cargo.toml`; no unwinder exists |
-  | `"features": "-mmx,-sse,+soft-float"` | forbid MMX/SSE, do float math in software |
-  | `"rustc-abi": "softfloat"` | tells rustc the ABI passes floats in integer registers, consistent with the above |
-  | `"disable-redzone": true` | the red zone is unsafe once interrupt handlers exist — they would clobber it |
-  | `"max-atomic-width": 64` | 64-bit atomics are available via `cmpxchg8b` |
-  | `"linker-flavor": "ld.lld"`, `"linker": "rust-lld"` | only used if cargo links; we link ourselves with `ld`, so these are inert for a `staticlib` |
-
-  Disabling SSE matters: the FPU and SSE units need explicit enabling
-  (`CR0`/`CR4` bits) after boot. If the compiler emitted an SSE instruction
-  before that happens, the CPU raises an exception and, with no handler
-  installed, the machine triple-faults. Forbidding the instruction set is
-  cheaper than initialising hardware we do not use.
-
-### `linker.ld` — where things land in memory
+Normally the compiler, the linker's default script and the OS loader agree on
+addresses without asking you. Here none of them exist, so you write it out:
 
 ```ld
 ENTRY(_start)
@@ -261,46 +234,99 @@ SECTIONS
 }
 ```
 
-`.` is the location counter — the address being assigned. Setting it to `1M`
-places the kernel at `0x100000` because the first megabyte of physical memory
-is not ours: it holds the real-mode interrupt vector table, BIOS data, the VGA
-framebuffer at `0xb8000`, and memory-mapped ROM. 1 MiB is the conventional
-first address a loaded kernel may own.
+`.` is the location counter: the address currently being handed out. Two
+decisions matter in those five lines.
 
-Order is load-bearing: `.multiboot` must come first so the header lands inside
-the 8 KiB window GRUB scans. `*(.text*)` gathers `.text` from every input file
-— our `boot.o` plus every object inside `libkernel.a` — into one output
-section.
+**Start at 1 MiB.** The first megabyte of physical memory is not ours. It holds
+the real-mode interrupt vector table, BIOS data, memory-mapped ROM, and the VGA
+text screen at `0xb8000`. 1 MiB (`0x100000`) is the conventional first address
+a loaded kernel may claim.
+
+**`.multiboot` first,** so the header lands inside the 8 KiB window GRUB
+scans. `*(.text*)` then gathers `.text` out of every input file — our `boot.o`
+plus every object inside `libkernel.a` — into one output section.
 
 The result:
 
 | Section | Address | Size | Notes |
 |---|---|---|---|
 | `.multiboot` | `0x100000` | 12 B | magic, flags, checksum |
-| `.text` | `0x100010` | 36 B | `_start`, `rust_begin_unwind`, `kmain` |
-| `.bss` | `0x100040` | 16 KiB | the stack; `NOBITS`, not stored on disk |
+| `.text` | `0x100010` | 36 B | `_start`, the panic handler, `kmain` |
+| `.bss` | `0x100040` | 16 KiB | the stack; never stored on disk |
 
-`.rodata` and `.data` are empty and get dropped. The ELF has one `LOAD` segment
-with `FileSiz 0x34` (52 bytes on disk) and `MemSiz 0x4040` (16 448 bytes in
-RAM) — the difference is the `.bss` the loader must provide but never reads
-from the image. The file on disk is 1 012 bytes; `size` reports 48 bytes of
-loadable non-`.bss` content (the 12-byte header plus 36 bytes of code) and
-16 384 bytes of `.bss`. The rest of the file is ELF metadata.
+`.rodata` and `.data` are empty and get dropped. The ELF ends up with a single
+loadable chunk: 52 bytes on disk expanding to 16 448 bytes in RAM, the
+difference being the `.bss` the loader must provide but never reads from the
+file. `build/kernel.bin` is 1 012 bytes total; the rest is ELF bookkeeping.
 
-The link line is:
+The link command:
 
 ```sh
 ld -m elf_i386 -n -T linker.ld -o build/kernel.bin \
    build/boot.o kernel/target/i686-kfs/release/libkernel.a
 ```
 
-`-m elf_i386` selects the 32-bit x86 output format (the host `ld` defaults to
-64-bit). `-n` turns off page-alignment of sections, keeping the image compact
-and the layout literal. `-T` supplies our script instead of the host's default
-one.
+`-m elf_i386` asks for 32-bit x86 output, since the host `ld` defaults to
+64-bit. `-n` switches off page-alignment of sections, keeping the image small
+and the layout literal. `-T` supplies our script instead of the host's default.
 
-> The subject forbids reusing the host's linker script but not the host's
+> The subject forbids reusing the host's linker *script*, not the host's
 > linker. `ld` is a tool; `linker.ld` is ours.
+
+### `kernel/i686-kfs.json` — inventing a platform
+
+You normally pick a target off a shelf: `x86_64-apple-darwin`,
+`i686-unknown-linux-gnu`. Every one of those names an operating system, and
+that is a lie here. There is no shelf entry for "32-bit x86, nothing
+underneath", so the spec sheet is written by hand:
+
+| Field | Why |
+|---|---|
+| `"llvm-target": "i686-unknown-none"` | 32-bit x86, no OS |
+| `"data-layout"` | type sizes and alignments for i686; must match the LLVM target or codegen is subtly wrong |
+| `"arch": "x86"`, `"target-pointer-width": 32` | 32-bit pointers |
+| `"cpu": "pentium4"` | the baseline instruction set to compile for |
+| `"os": "none"` | no syscalls, no libc assumptions |
+| `"panic-strategy": "abort"` | there is no unwinder to unwind into |
+| `"features": "-mmx,-sse,+soft-float"` | forbid the vector units, do float maths in software |
+| `"rustc-abi": "softfloat"` | consistent with the above: floats travel in integer registers |
+| `"disable-redzone": true` | the red zone is 128 bytes below `esp` a function may scribble in without reserving. Legal in userland, fatal once interrupt handlers exist — they push data there and silently eat it |
+| `"max-atomic-width": 64` | 64-bit atomics work on this CPU via `cmpxchg8b` |
+| `"linker-flavor"`, `"linker"` | only used if cargo does the linking. We link ourselves, so these are inert |
+
+The SSE line is the one worth understanding. Floating-point and vector units on
+x86 have to be switched on explicitly after boot, by setting bits in CPU
+control registers. If the optimiser emitted a single SSE instruction before
+that happened, the CPU would raise an exception, find no handler installed, and
+triple-fault. Banning an instruction set we do not use is cheaper than
+initialising hardware we do not need.
+
+Because no prebuilt standard library exists for a target we just invented,
+`kernel/.cargo/config.toml` rebuilds one from source:
+
+```toml
+[build]
+target = "i686-kfs.json"
+
+[unstable]
+json-target-spec = true
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+```
+
+`build-std` compiles `core` and `compiler_builtins` for our target.
+`compiler-builtins-mem` supplies `memcpy`, `memset` and `memcmp` in Rust: LLVM
+emits calls to those names for struct copies and slice operations, and on a
+normal system libc provides them. We have no libc. `json-target-spec` is what
+permits `.json` target files on current nightly at all, and nightly itself is
+required because rebuilding `core` is an unstable feature — pinned in
+`rust-toolchain.toml` so `rustup` handles it without manual juggling.
+
+`Cargo.toml` asks for `crate-type = ["staticlib"]`, so cargo produces
+`libkernel.a` (752 190 bytes) instead of an executable: a bag of parts for our
+own `ld` invocation to assemble, rather than a finished program linked with the
+wrong script. `panic = "abort"` in both profiles strips the unwinding machinery,
+which would otherwise want a runtime we do not have.
 
 ### `grub.cfg` — the boot menu
 
@@ -313,17 +339,14 @@ menuentry "kfs-1" {
 }
 ```
 
-`timeout=0` boots immediately with no menu. `multiboot` is GRUB's command for
-loading a multiboot-1 kernel — it is what validates the header, moves the
-segments and enters protected mode. `boot` transfers control.
-
-The path is inside the ISO, not the host filesystem: `make` stages
+`timeout=0` boots straight through with no menu. `multiboot` is the GRUB
+command that loads a multiboot-1 kernel: it validates the header, copies the
+image to its load address and enters 32-bit protected mode. `boot` transfers
+control. The path is inside the ISO, not on your machine — `make` stages
 `build/iso/boot/kernel.bin` and `build/iso/boot/grub/grub.cfg` before calling
 `grub-mkrescue`.
 
-### `Makefile` — the pipeline
-
-Four artifacts, in order:
+### `Makefile` — four artifacts in order
 
 ```
 boot/boot.asm ──nasm -f elf32──────────────► build/boot.o        (928 B)
@@ -332,72 +355,84 @@ both          ──ld -m elf_i386 -n -T ...───► build/kernel.bin    (1 
 kernel.bin    ──grub-mkrescue──────────────► kfs.iso             (5 083 136 B)
 ```
 
-Details worth knowing:
+A 1 KB kernel produces a 5 MB image because `grub-mkrescue` copies GRUB itself
+and its entire module tree — 294 files in this build — onto the ISO.
 
-- Tool names live in variables, and GRUB's are auto-detected because Fedora
-  ships `grub2-mkrescue`/`grub2-file` while Debian ships `grub-mkrescue`/
-  `grub-file`.
-- `cargo` is a **phony** target: cargo has its own, better change detection, so
-  Make always delegates rather than trying to model Rust dependencies. The cost
-  is that `kernel.bin` relinks every build — a link of 1 KB is free.
-- Two assertions run inside the build, not as separate steps: `grub-file
-  --is-x86-multiboot` on the linked binary, and a size check that fails the
-  build if the ISO exceeds 10 485 760 bytes.
+Worth knowing:
+
+- GRUB's tool names are auto-detected: Fedora ships `grub2-mkrescue` and
+  `grub2-file`, Debian ships `grub-mkrescue` and `grub-file`.
+- `cargo` is a **phony** target. Cargo's own change detection is better than
+  anything Make could model for Rust, so Make always delegates. The cost is
+  that `kernel.bin` relinks every build, and linking 1 KB is free.
+- Two assertions run inside the build rather than as separate steps:
+  `grub-file --is-x86-multiboot` on the linked binary, and a size check that
+  fails the build above 10 485 760 bytes.
 - `clean` / `fclean` / `re` follow 42 conventions. `clean` also runs
-  `cargo clean`, otherwise `kernel/target` (hundreds of MB) survives.
+  `cargo clean`, or `kernel/target` (hundreds of MB) would survive it.
 - `docker-%` is a pattern rule: `make docker-check` builds the dev image and
   runs `make check` inside it. There is no separate in-container logic — the
   container runs the same native rules against the bind-mounted repo. It exists
-  because the development machine is arm64 macOS with no x86 toolchain;
+  because this development machine is arm64 macOS with no x86 toolchain;
   evaluation on Fedora never uses it.
 
-## 4. What the machine is doing right now
+## 5. Why the screen looks frozen
 
-Boot the ISO and the screen stops at `Booting "kfs-1"` with a blinking cursor
-below it. That is the expected, correct end state, and the reasoning is worth
-following because it is the same reasoning used to debug a real hang:
+Boot the ISO and you get a nearly black screen with a few grey characters in
+the top-left corner and a blinking cursor. **That is the correct result today,**
+and the reasoning is the same reasoning used to debug a real hang:
 
-1. GRUB printed that line, then loaded and jumped to our kernel.
-2. `kmain` is `pause; jmp` — it never writes to the screen. Nothing clears the
-   VGA text buffer, so GRUB's last message stays visible forever. The kernel
-   is not stuck *at* GRUB; GRUB's output is just the last thing anything drew.
-3. Measured evidence, two samples 15 s apart on one boot: `EIP=0x00100032`
-   both times — the `jmp` inside `kmain`, which sits at `0x100030`. Between the
-   samples only 18 pixels changed, a 9×2 block at text cell row 2 / column 0:
-   the hardware cursor blinking.
+1. GRUB printed those characters while it was loading.
+2. `kmain` is `pause; jmp`. It never writes to the screen. Nothing clears the
+   VGA text buffer at `0xb8000`, so GRUB's last output simply stays lit
+   forever. The kernel is not stuck *at* GRUB — GRUB's text is just the last
+   thing anything drew.
+3. Measured: two samples 15 s apart on one boot both report `EIP=0x00100032`,
+   the `jmp` inside `kmain` at `0x100030`. Between the samples 18 pixels
+   changed, a 9x2 block at row 2, column 0. That is the hardware cursor
+   blinking. A full frame dump is 720x400 with 376 lit pixels, every one of
+   them `#a8a8a8`, confined to text rows 0-2 and columns 0-16.
 
-Contrast with real failures:
+Real failures look different:
 
 | Symptom | Diagnosis |
 |---|---|
-| BIOS splash and GRUB menu reappear in a loop | triple fault — the CPU faulted with no handler, then faulted handling that |
-| GRUB error instead of `Booting` | bad multiboot header, or the path in `grub.cfg` is wrong |
-| `EIP` below `0x100000` | execution left the kernel — bad jump, or the image was never loaded |
+| BIOS splash and GRUB menu reappear in a loop | triple fault: the CPU faulted, faulted handling that, gave up and reset |
+| A GRUB error instead of `Booting` | bad multiboot header, or a wrong path in `grub.cfg` |
+| `EIP` below `0x100000` | execution left the kernel: bad jump, or the image never loaded |
 | QEMU monitor unreachable | the process died outright |
 
-## 5. Verification
+## 6. How we prove it works
 
-`make check` is the proof of life, since there is nothing to look at:
+You cannot `assert` from inside this kernel. There is no test harness, no
+process to exit with a status, and nowhere to print. So `make check` is a unit
+test for the whole machine, asking the emulator from the outside where the CPU
+ended up:
 
-1. Start QEMU with `-display none` and a monitor on a unix socket:
-   `-monitor unix:/tmp/kfs-mon,server,nowait`.
+1. Start QEMU with no window and a control socket:
+   `-display none -monitor unix:/tmp/kfs-mon,server,nowait`.
 2. Wait 5 s.
 3. `printf 'info registers\nquit\n' | socat - unix-connect:/tmp/kfs-mon`.
-4. Extract `EIP` and require it to be ≥ `0x100000`.
+4. Pull out `EIP` and require it to be at or above `0x100000`.
 
-Two independent facts have to hold for it to pass: QEMU was still alive to
+Two independent facts have to hold for that to pass: QEMU was still alive to
 answer at all, and the instruction pointer is inside the kernel's address
-range. Output:
+range.
 
 ```
 OK: kfs.iso is 5083136 bytes (limit 10485760)
 OK: guest alive, EIP=00100032 inside kernel
 ```
 
-`make re` is the other check that matters: a full `fclean` and rebuild proves
-the clean targets really remove everything and the build works from nothing.
+`kmain` links at `0x100030`, so `EIP=0x100032` is two bytes in — parked on the
+`jmp` of its spin loop. GRUB accepted the header, `_start` set `esp` and called
+into Rust, and the machine is not rebooting in a loop.
 
-## 6. Toolchain the numbers came from
+`make re` is the other check that matters: a full `fclean` and rebuild proves
+the clean targets really remove everything and that the build works from
+nothing.
+
+## 7. Toolchain the numbers came from
 
 ```
 NASM 2.16.01
@@ -407,5 +442,4 @@ grub-mkrescue (GRUB) 2.06
 QEMU qemu-system-i386
 ```
 
-Sizes and addresses shift slightly with different versions; the structure does
-not.
+Sizes and addresses shift a little with other versions. The structure does not.
