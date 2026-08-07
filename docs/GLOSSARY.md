@@ -62,7 +62,7 @@ The VGA text output ([VGA.md](VGA.md)) is this kernel's first driver.
 **Panic** — a bug the program has decided it cannot survive. In userland
 something catches it and kills your process; here nobody is listening, so a
 panic can only stop the machine. Here: the `#[panic_handler]` in
-`kernel/src/lib.rs` spins forever.
+`kernel/src/lib.rs` prints the panic in bright red, then spins forever.
 
 ---
 
@@ -188,7 +188,7 @@ which is why the multiboot magic `0x1BADB002` appears in the binary as
 through `ESP`. Nobody hands a kernel one; it reserves memory and points `ESP` at
 it. On x86 the stack grows *downwards*, so the initial pointer is the *highest*
 address of the reserved region. Here: 16 KiB in `.bss`, with `esp` starting at
-`stack_top` = `0x104370`.
+`stack_top` = `0x104360`.
 
 ---
 
@@ -304,7 +304,7 @@ to produce a 32-bit ELF object.
 **Mnemonic** — the human-readable name of an instruction: `mov`, `call`, `jmp`.
 
 **Opcode / machine code** — the actual bytes the CPU executes.
-`mov esp, 0x104370` is `bc 70 43 10 00`.
+`mov esp, 0x104360` is `bc 60 43 10 00`.
 
 **Label** — a name for an address (`_start:`, `stack_top:`). In NASM a label
 beginning with `.` belongs to the previous global label, which is why the hang
@@ -420,7 +420,7 @@ off.
 
 **Segment / program header** — the loader's view of an ELF: which byte ranges to
 copy to which addresses with which permissions. Our kernel has one `LOAD`
-segment, 872 bytes on disk expanding to 17 272 in RAM.
+segment, 856 bytes on disk expanding to 17 256 in RAM.
 
 **Static library / archive (`.a`)** — a bundle of object files in one file.
 `cargo` emits `libkernel.a` — a bag of parts rather than a finished program — so
@@ -428,9 +428,10 @@ segment, 872 bytes on disk expanding to 17 272 in RAM.
 and listed with `ar`.
 
 **Name mangling** — the compiler encoding module paths and types into a symbol's
-name so same-named functions cannot collide. This kernel's panic handler ends up
-as `_RNvCschKVOpqoY1I_7___rustc17rust_begin_unwind`. `#[no_mangle]` switches it
-off so assembly can refer to `kmain` by that exact name.
+name so same-named functions cannot collide. This kernel's panic handler is
+mangled to `_RNvCschKVOpqoY1I_7___rustc17rust_begin_unwind` (visible whenever a
+panic site exists — see ARCHITECTURE on LTO). `#[no_mangle]` switches it off so
+assembly can refer to `kmain` by that exact name.
 
 **`nm` / `objdump` / `readelf`** — the inspection tools: list symbols,
 disassemble and dump sections, print ELF headers. Every address quoted in

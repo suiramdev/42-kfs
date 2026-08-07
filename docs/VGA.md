@@ -1,9 +1,10 @@
 # Screen output
 
 The subject requires the kernel to display "42". It does — white on black, with
-a bright-green "kfs-1" underneath — and the driver behind it now covers the
-subject's first two bonuses: colours, a tracked cursor with line wrapping, and
-scrolling. This file explains what "the screen" actually is on this machine,
+a bright-green "kfs-1" underneath — and the driver behind it covers most of the
+subject's bonuses: colours, a tracked cursor with line wrapping, scrolling, and
+the `printk!` formatter built on top ([ARCHITECTURE.md](ARCHITECTURE.md) covers
+that last one). This file explains what "the screen" actually is on this machine,
 how `kernel/src/vga.rs` drives it, and how the result is verified.
 
 ## What "the screen" actually is here
@@ -49,8 +50,9 @@ compiler — see `volatile` below.
   concurrent (one CPU, interrupts never enabled, every call rooted in `kmain`'s
   single call chain), and the module keeps them private behind accessor
   functions.
-- **No allocation, no `core::fmt`.** There is no heap, and the formatting
-  machinery waits for the `printk` bonus.
+- **No allocation.** There is no heap; even `printk!`'s formatting runs
+  allocation-free, `format_args!` feeding `write_str` calls straight into the
+  driver.
 - **API:**
   - `pub fn clear()` — fill all 80x25 cells with a space in the current
     colour, cursor back to the top-left.
@@ -62,9 +64,12 @@ compiler — see `volatile` below.
     and wrap at column 80. Output past the bottom row scrolls everything up
     one line: rows 1-24 are copied over rows 0-23 — whole u16s, so each
     character keeps its colour — and the bottom row is blanked.
+- **`Writer`** — a unit struct implementing `core::fmt::Write` over `print`,
+  the three-line hook that gives the `printk!` macro (and panics) the whole
+  formatting engine. The macro itself lives in `kernel/src/printk.rs`.
 - **`kmain`:** clear, print "42" — computed through `klib::utoa(42, &mut buf)`
   rather than written as a literal, so the kernel library is exercised on the
-  mandatory path — then "kfs-1" in bright green.
+  mandatory path — then `printk!("kfs-{}\n", 1)` in bright green.
 
 ## The hardware cursor
 
@@ -94,9 +99,7 @@ printed 33 lines and a 200-character line):
 
 ## Later, for the bonus part
 
-A `printk`-style formatter implementing `core::fmt::Write`, so `write!` works
-(numbers currently go through `klib::utoa` by hand); keyboard input; multiple
-virtual screens.
+Keyboard input, and multiple virtual screens with shortcuts to switch.
 
 ## How it is verified
 
@@ -123,7 +126,7 @@ restated in the Makefile next to the check.
 A successful run prints:
 
 ```
-OK: guest alive, EIP=00100352 inside kernel
+OK: guest alive, EIP=00100342 inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
 

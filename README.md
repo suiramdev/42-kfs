@@ -73,8 +73,8 @@ the qemu monitor for `info registers` until the kernel is reached (up to 60 s
 dump:
 
 ```
-OK: kfs.iso is 5085184 bytes (limit 10485760)
-OK: guest alive, EIP=00100352 inside kernel
+OK: kfs.iso is 5083136 bytes (limit 10485760)
+OK: guest alive, EIP=00100342 inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
 
@@ -82,7 +82,7 @@ Three facts have to hold: qemu is still alive to answer, the instruction
 pointer is at or above 1 MiB where the kernel was loaded, and the dumped frame
 shows white pixels (the "42" glyphs) with none of GRUB's grey `#a8a8a8`
 leftovers (so our clear really overwrote the screen). `kmain` links at
-`0x100030` (`nm build/kernel.bin`); `EIP=0x100352` is parked on the `jmp` of
+`0x100030` (`nm build/kernel.bin`); `EIP=0x100342` is parked on the `jmp` of
 its idle loop, after the screen writes. That means GRUB accepted our binary,
 `_start` set up a stack, and Rust ran to the end of `kmain`'s work. An
 unreachable monitor, or an `EIP` below 1 MiB, means the guest died.

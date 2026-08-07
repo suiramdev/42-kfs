@@ -41,10 +41,13 @@ Working:
 - The start of a kernel library: C-string helpers for the multiboot data GRUB
   hands us, and number-to-text conversion. The displayed "42" actually goes
   through it.
+- `printk!` — `core`'s whole formatting engine hooked onto the screen through
+  one trait impl. Panics now print themselves in red instead of silently
+  freezing the machine.
 - A custom compilation target: 32-bit x86, no floating-point hardware, no OS
   underneath.
 - A linker script placing the kernel at 1 MiB with the multiboot header first.
-- A bootable GRUB ISO, 5 085 184 bytes (the subject's limit is 10 MiB).
+- A bootable GRUB ISO, 5 083 136 bytes (the subject's limit is 10 MiB).
 - `make check`, which proves the kernel is really executing *and* really drew
   "42" on the screen.
 
@@ -69,7 +72,7 @@ graph TD
     F --> G[GRUB scans the first 8 KiB of kernel.bin<br/>for the magic number 0x1BADB002]
     G --> H[Switches the CPU to 32-bit protected mode,<br/>copies our code to its load address]
     H --> I[Jumps to the ELF entry point 0x100010 = _start]
-    I --> J[_start: mov esp, 0x104370]
+    I --> J[_start: mov esp, 0x104360]
     J --> K[call kmain]
     K --> L[kmain: clear the screen, print 42 and kfs-1,<br/>then idle forever]
 ```
@@ -100,7 +103,7 @@ order to run at all. "The stack does not exist yet" is not a state Rust can
 express. That single problem is the entire reason there is an assembly file in
 this repo.
 
-## 4. The seven files that are the project
+## 4. The eight files that are the project
 
 Everything else is documentation or build plumbing.
 
@@ -159,8 +162,8 @@ literal array of 16 384 zeros compiled into the binary. x86 stacks grow
 
 ```
 00100010 <_start>:
-  100010: bc 70 43 10 00    mov  $0x104370,%esp
-  100015: e8 16 00 00 00    call 100030 <kmain>
+  100010: bc 60 43 10 00    mov  $0x104360,%esp
+  100015: e8 06 00 00 00    call 100020 <kmain>
 
 0010001a <_start.hang>:
   10001a: fa                cli
@@ -168,8 +171,8 @@ literal array of 16 384 zeros compiled into the binary. x86 stacks grow
   10001c: eb fc             jmp  10001a
 ```
 
-`0x104370` is `stack_top` after the linker resolved it: `stack_bottom` at
-`0x100370` plus 16 384. The hang loop below the `call` is unreachable while
+`0x104360` is `stack_top` after the linker resolved it: `stack_bottom` at
+`0x100360` plus 16 384. The hang loop below the `call` is unreachable while
 `kmain` never returns, but it is the right thing to have there: `cli` switches
 interrupts off, `hlt` stops the CPU until one arrives anyway, and the `jmp`
 re-halts if something wakes it. Halting is not spinning — `hlt` lets a physical
@@ -188,7 +191,10 @@ silent build.
 #![no_std]
 
 mod klib;
+mod printk;
 mod vga;
+
+use printk::printk;
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
@@ -197,13 +203,15 @@ pub extern "C" fn kmain() -> ! {
     vga::print(klib::utoa(42, &mut buf));
     vga::print("\n");
     vga::set_color(vga::Color::BrightGreen, vga::Color::Black);
-    vga::print("kfs-1\n");
+    printk!("kfs-{}\n", 1);
     vga::set_color(vga::Color::White, vga::Color::Black);
     loop { core::hint::spin_loop(); }
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    vga::set_color(vga::Color::BrightRed, vga::Color::Black);
+    printk!("\npanic: {}\n", info);
     loop { core::hint::spin_loop(); }
 }
 ```
@@ -223,10 +231,22 @@ loop is waiting on something, which saves power and avoids a pipeline penalty.
 The optimiser inlines the whole driver into `kmain`, which compiles to 804
 bytes ending in the `pause; jmp` idle pair the check finds `EIP` parked on.
 
-For contrast with `#[no_mangle]`: the panic handler *is* mangled, and appears in
-the symbol table at `0x100020` as
-`_RNvCschKVOpqoY1I_7___rustc17rust_begin_unwind` (the hash in the middle
-changes with the compiler version).
+The panic handler prints the panic — location, message, formatted values — in
+bright red before idling, which turns the failure mode from "screen freezes"
+into an actual error report. Two things worth knowing about it:
+
+- Printing from a panic reuses the very driver the panicking code may have
+  been in the middle of. That is acceptable precisely because a panic is
+  terminal: nothing runs afterwards, so corrupt-looking output is a cosmetic
+  risk, not a correctness one.
+- It is not in the shipped binary. Link-time optimisation proved that no code
+  path in today's kernel can actually panic (`put_cell`'s bound check is a
+  `debug_assert!`, `utoa` cannot fail, the one `printk!` folds at compile
+  time), so the whole handler — and with it all of `core::fmt`'s machinery —
+  is dead code and gets dropped. Introduce a real `panic!` and it all comes
+  back: measured by temporarily panicking in `kmain`, which grew
+  `kernel.bin` from 2 016 to 7 044 bytes and printed
+  `panicked at src/lib.rs:21:5` in red on boot.
 
 ### `kernel/src/klib.rs` — the start of a kernel library
 
@@ -249,6 +269,21 @@ function of a constant, so LLVM evaluated the whole digit loop at compile
 time — at the commit introducing it, the linked binary came out byte-for-byte
 identical to the literal-string version. The helper is real, exercised on the
 mandatory path, and free.
+
+### `kernel/src/printk.rs` — printf without an OS
+
+`core` cannot print — but it ships the complete formatting engine, held back
+by one missing piece: somewhere for the text to go. The contract is
+`core::fmt::Write`: implement a single method, `write_str`, and the trait
+hands you `write_fmt` and with it every `{}`, `{:x}`, width and padding rule
+Rust has. `vga::Writer` is that implementation (three lines: forward to
+`vga::print`), and `printk!` wraps `core::format_args!` the way `println!`
+does in userland. No allocation anywhere: `format_args!` compiles the format
+string into a series of `write_str` calls at compile time.
+
+This is the classic Rust-kernel move — the standard library's I/O is gone,
+but the *language-level* machinery (traits, `format_args!`) never depended on
+an OS in the first place.
 
 ### `kernel/src/vga.rs` — the screen driver
 
@@ -299,14 +334,14 @@ The result:
 | Section | Address | Size | Notes |
 |---|---|---|---|
 | `.multiboot` | `0x100000` | 12 B | magic, flags, checksum |
-| `.text` | `0x100010` | 836 B | `_start`, the panic handler, `kmain` with the whole driver inlined |
-| `.rodata` | `0x100354` | 6 B | one string: `"kfs-1\n"` — the "42" is computed, never stored |
-| `.bss` | `0x100370` | 16 KiB + 8 B | the stack, then the driver's cursor and colour; never stored on disk |
+| `.text` | `0x100010` | 820 B | `_start` and `kmain` with the whole driver inlined |
+| `.rodata` | `0x100344` | 6 B | one string: `"kfs-1\n"` — the "42" is computed, never stored |
+| `.bss` | `0x100360` | 16 KiB + 8 B | the stack, then the driver's cursor and colour; never stored on disk |
 
 `.data` is empty and gets dropped. The ELF ends up with a single loadable
-chunk: 872 bytes on disk expanding to 17 272 bytes in RAM, the difference
+chunk: 856 bytes on disk expanding to 17 256 bytes in RAM, the difference
 being the `.bss` the loader must provide but never reads from the file.
-`build/kernel.bin` is 2 096 bytes total; the rest is ELF bookkeeping.
+`build/kernel.bin` is 2 016 bytes total; the rest is ELF bookkeeping.
 
 The link command:
 
@@ -371,7 +406,11 @@ permits `.json` target files on current nightly at all, and nightly itself is
 required because rebuilding `core` is an unstable feature — pinned in
 `rust-toolchain.toml` so `rustup` handles it without manual juggling.
 
-`Cargo.toml` asks for `crate-type = ["staticlib"]`, so cargo produces
+`Cargo.toml` asks for `lto = true` with a single codegen unit: whole-program
+link-time optimisation is what lets the compiler prove `core::fmt`'s
+machinery unreachable today and drop it — without it, linking in `printk`
+took `kernel.bin` from 2 KB to 430 KB; with it, back to 2 016 bytes (see the
+panic handler notes above). And it asks for `crate-type = ["staticlib"]`, so cargo produces
 `libkernel.a` (748 246 bytes) instead of an executable: a bag of parts for our
 own `ld` invocation to assemble, rather than a finished program linked with the
 wrong script. `panic = "abort"` in both profiles strips the unwinding machinery,
@@ -399,9 +438,9 @@ control. The path is inside the ISO, not on your machine — `make` stages
 
 ```
 boot/boot.asm ──nasm -f elf32──────────────► build/boot.o        (928 B)
-kernel/src/*  ──cargo build --release──────► libkernel.a         (750 KB)
-both          ──ld -m elf_i386 -n -T ...───► build/kernel.bin    (2 096 B)
-kernel.bin    ──grub-mkrescue──────────────► kfs.iso             (5 085 184 B)
+kernel/src/*  ──cargo build --release──────► libkernel.a         (339 KB)
+both          ──ld -m elf_i386 -n -T ...───► build/kernel.bin    (2 016 B)
+kernel.bin    ──grub-mkrescue──────────────► kfs.iso             (5 083 136 B)
 ```
 
 A 2 KB kernel produces a 5 MB image because `grub-mkrescue` copies GRUB itself
@@ -480,13 +519,13 @@ answer at all, the instruction pointer is inside the kernel's address range,
 and the kernel's writes really reached the VGA buffer.
 
 ```
-OK: kfs.iso is 5085184 bytes (limit 10485760)
-OK: guest alive, EIP=00100352 inside kernel
+OK: kfs.iso is 5083136 bytes (limit 10485760)
+OK: guest alive, EIP=00100342 inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
 
-`kmain` occupies `0x100030`-`0x100354` and ends in its idle loop, so
-`EIP=0x100352` is parked on that loop's `jmp`. GRUB accepted the header,
+`kmain` occupies `0x100020`-`0x100344` and ends in its idle loop, so
+`EIP=0x100342` is parked on that loop's `jmp`. GRUB accepted the header,
 `_start` set `esp`, Rust ran the VGA writes to completion, and the machine is
 not rebooting in a loop.
 

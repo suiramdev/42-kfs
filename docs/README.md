@@ -24,11 +24,13 @@ linked with our own linker script — which clears the screen and displays the
 mandatory "42" ([VGA.md](VGA.md)), computed through the first pieces of a
 kernel library (`utoa`, plus C-string helpers for the multiboot data to come).
 
-The first bonuses are in too: colours, a tracked cursor with wrapping and
-scrolling, and the blinking hardware cursor driven through I/O ports.
+Most bonuses are in too: colours, a tracked cursor with wrapping and
+scrolling, the blinking hardware cursor driven through I/O ports, and
+`printk!` — `core`'s formatting engine hooked onto the screen, which also
+lets panics print themselves in red.
 
-Not built yet: a `printk` formatter and keyboard input (the remaining
-bonuses); interrupts, our own segment table and paging come after.
+Not built yet: keyboard input and multiple screens (the remaining bonuses);
+interrupts, our own segment table and paging come after.
 
 ## Reading order
 
