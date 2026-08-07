@@ -13,18 +13,18 @@ assembly, a linker script, or a bootloader.
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the whole thing works: power-on to the kernel's idle loop, every file's job, the memory map, and how the build is proven correct |
 | [GLOSSARY.md](GLOSSARY.md) | Every technical term used here, defined in plain language with comparisons to code you already know — kernel, GRUB, multiboot, linker script, `no_std`, and about a hundred more |
-| [VGA.md](VGA.md) | The one thing deliberately **not** built yet: putting characters on screen, and the design for it |
+| [VGA.md](VGA.md) | How characters get on screen: the VGA text buffer, the driver module, what the optimiser made of it, and how the check proves the "42" is lit |
 | `en.subject.pdf` | The original 42 assignment |
 
 ## Where the project stands
 
 Working and measured: a 32-bit x86 kernel that GRUB loads from a 5 MB ISO and
 runs at address 1 MiB — an assembly boot stub plus a `no_std` Rust kernel,
-linked with our own linker script.
+linked with our own linker script — which clears the screen and displays the
+mandatory "42" ([VGA.md](VGA.md)).
 
-Not built yet: anything visible. `kmain` idles in a two-instruction loop, so the
-screen still shows GRUB's last message. The mandatory "42" is the next step
-([VGA.md](VGA.md)); interrupts, our own segment table and paging come after.
+Not built yet: scrolling, colours, keyboard input (the subject's bonuses);
+interrupts, our own segment table and paging come after.
 
 ## Reading order
 
@@ -35,6 +35,7 @@ it goes.
 
 **Just want to build and run it?** That is the [root README](../README.md).
 
-**Wondering why the screen looks frozen?** It is supposed to.
-[ARCHITECTURE.md §5](ARCHITECTURE.md#5-why-the-screen-looks-frozen) explains
-what the machine is doing, with measurements.
+**Wondering what the screen should show?** A black screen, a white "42", and a
+blinking cursor GRUB left behind.
+[ARCHITECTURE.md §5](ARCHITECTURE.md#5-what-the-screen-shows) explains each
+part, with measurements.

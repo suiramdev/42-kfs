@@ -162,8 +162,8 @@ instructions on a separate, small address space of its own. Needed later for the
 hardware cursor (ports `0x3D4`/`0x3D5`).
 
 **VGA text mode** — the 80×25 grid of characters a PC starts up in. Each cell is
-two bytes at `0xb8000`: a character code and a colour attribute. Here: the
-subject of [VGA.md](VGA.md), not yet implemented.
+two bytes at `0xb8000`: a character code and a colour attribute. Here: driven
+by `kernel/src/vga.rs`, the subject of [VGA.md](VGA.md).
 
 **Framebuffer** — the region of memory a display continuously reads its pixels
 or characters out of. Change the memory and the screen changes.
@@ -188,7 +188,7 @@ which is why the multiboot magic `0x1BADB002` appears in the binary as
 through `ESP`. Nobody hands a kernel one; it reserves memory and points `ESP` at
 it. On x86 the stack grows *downwards*, so the initial pointer is the *highest*
 address of the reserved region. Here: 16 KiB in `.bss`, with `esp` starting at
-`stack_top` = `0x104040`.
+`stack_top` = `0x104070`.
 
 ---
 
@@ -304,7 +304,7 @@ to produce a 32-bit ELF object.
 **Mnemonic** — the human-readable name of an instruction: `mov`, `call`, `jmp`.
 
 **Opcode / machine code** — the actual bytes the CPU executes.
-`mov esp, 0x104040` is `bc 40 40 10 00`.
+`mov esp, 0x104070` is `bc 70 40 10 00`.
 
 **Label** — a name for an address (`_start:`, `stack_top:`). In NASM a label
 beginning with `.` belongs to the previous global label, which is why the hang
@@ -420,7 +420,7 @@ off.
 
 **Segment / program header** — the loader's view of an ELF: which byte ranges to
 copy to which addresses with which permissions. Our kernel has one `LOAD`
-segment, 52 bytes on disk expanding to 16 448 in RAM.
+segment, 100 bytes on disk expanding to 16 496 in RAM.
 
 **Static library / archive (`.a`)** — a bundle of object files in one file.
 `cargo` emits `libkernel.a` — a bag of parts rather than a finished program — so
@@ -429,7 +429,7 @@ and listed with `ar`.
 
 **Name mangling** — the compiler encoding module paths and types into a symbol's
 name so same-named functions cannot collide. This kernel's panic handler ends up
-as `_RNvCsj5li9sZI3iI_7___rustc17rust_begin_unwind`. `#[no_mangle]` switches it
+as `_RNvCschKVOpqoY1I_7___rustc17rust_begin_unwind`. `#[no_mangle]` switches it
 off so assembly can refer to `kmain` by that exact name.
 
 **`nm` / `objdump` / `readelf`** — the inspection tools: list symbols,
@@ -572,10 +572,8 @@ Exposed here on a unix socket with `-monitor unix:/tmp/kfs-mon,server,nowait`.
 The `EIP` it reports is the proof that the kernel is executing.
 
 **`screendump file.ppm`** — the monitor command writing the current guest screen
-to an image. Used to confirm that the only thing on screen is GRUB's leftover
-text plus a blinking cursor: nothing in this kernel ever writes to the screen,
-so those pixels simply stay lit. The frozen-looking screen is the correct
-result.
+to an image. `make check` uses it to confirm the "42" glyphs are lit in white
+and that none of GRUB's grey leftover text survived the kernel's screen clear.
 
 **Headless** — running with no display attached.
 
