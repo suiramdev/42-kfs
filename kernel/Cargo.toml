@@ -12,3 +12,7 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 opt-level = 2
+# core::fmt drags in far more than the kernel calls; whole-program LTO in
+# one codegen unit lets the linker-time optimiser prove most of it dead.
+lto = true
+codegen-units = 1

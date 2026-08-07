@@ -3,7 +3,10 @@
 use core::panic::PanicInfo;
 
 mod klib;
+mod printk;
 mod vga;
+
+use printk::printk;
 
 /// Kernel entry point, called from `_start` in `boot/boot.asm`.
 #[no_mangle]
@@ -13,15 +16,21 @@ pub extern "C" fn kmain() -> ! {
     vga::print(klib::utoa(42, &mut buf));
     vga::print("\n");
     vga::set_color(vga::Color::BrightGreen, vga::Color::Black);
-    vga::print("kfs-1\n");
+    printk!("kfs-{}\n", 1);
     vga::set_color(vga::Color::White, vga::Color::Black);
     loop {
         core::hint::spin_loop();
     }
 }
 
+/// Panics land here — and now show up on screen instead of silently
+/// freezing the machine. Printing may itself touch the driver state the
+/// panicking code was in; acceptable, because a panic is already the
+/// end: nothing runs afterwards but the idle loop.
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    vga::set_color(vga::Color::BrightRed, vga::Color::Black);
+    printk!("\npanic: {}\n", info);
     loop {
         core::hint::spin_loop();
     }

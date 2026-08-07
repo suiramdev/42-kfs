@@ -99,6 +99,18 @@ pub fn print(s: &str) {
     sync_hw_cursor();
 }
 
+/// The hook `printk` hangs the formatting engine on: implementing
+/// `write_str` is what makes `write_fmt` — and every format rule core
+/// knows — work against this screen.
+pub struct Writer;
+
+impl core::fmt::Write for Writer {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        print(s);
+        Ok(())
+    }
+}
+
 fn putb(b: u8) {
     match b {
         b'\n' => set_cursor(cursor() - cursor() % WIDTH + WIDTH),
