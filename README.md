@@ -67,8 +67,10 @@ state GRUB left behind, and nothing moves it yet (see the bonus section of
 The eyeball test is not the proof, though — `make check` is. You cannot
 `assert` from inside a kernel — no test harness, no exit status, nowhere to
 print — so the check asks the emulator from the outside what state the machine
-ended up in. It boots the ISO with no display, waits 5 s, then over a unix
-socket asks the qemu monitor for `info registers` and a framebuffer dump:
+ended up in. It boots the ISO with no display, then over a unix socket polls
+the qemu monitor for `info registers` until the kernel is reached (up to 60 s
+— boot is slow inside the emulated dev container) and takes a framebuffer
+dump:
 
 ```
 OK: kfs.iso is 5083136 bytes (limit 10485760)

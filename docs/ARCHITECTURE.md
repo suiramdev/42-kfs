@@ -36,6 +36,9 @@ Working:
   the language demands.
 - A VGA text driver — clear the screen, print a string — and `kmain` using it
   to display "42". The screen model and the module are [VGA.md](VGA.md).
+- The start of a kernel library: C-string helpers for the multiboot data GRUB
+  hands us, and number-to-text conversion. The displayed "42" actually goes
+  through it.
 - A custom compilation target: 32-bit x86, no floating-point hardware, no OS
   underneath.
 - A linker script placing the kernel at 1 MiB with the multiboot header first.
@@ -95,7 +98,7 @@ order to run at all. "The stack does not exist yet" is not a state Rust can
 express. That single problem is the entire reason there is an assembly file in
 this repo.
 
-## 4. The six files that are the project
+## 4. The seven files that are the project
 
 Everything else is documentation or build plumbing.
 
@@ -182,12 +185,14 @@ silent build.
 ```rust
 #![no_std]
 
+mod klib;
 mod vga;
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     vga::clear();
-    vga::print("42");
+    let mut buf = [0u8; 10];
+    vga::print(klib::utoa(42, &mut buf));
     loop { core::hint::spin_loop(); }
 }
 
@@ -216,6 +221,28 @@ For contrast with `#[no_mangle]`: the panic handler *is* mangled, and appears in
 the symbol table at `0x100020` as
 `_RNvCschKVOpqoY1I_7___rustc17rust_begin_unwind` (the hash in the middle
 changes with the compiler version).
+
+### `kernel/src/klib.rs` — the start of a kernel library
+
+The subject asks for "basic functions (strlen, strcmp, ...)" because a kernel
+has no libc. In Rust most of that shelf already exists: `core` provides
+`str::len` and slice comparison, and the build's `compiler-builtins-mem`
+feature provides `memcpy`/`memset`/`memcmp`. What is genuinely missing are the
+C-shaped pieces, so that is what `klib` holds:
+
+- `strlen` / `strcmp` over NUL-terminated C strings — the format GRUB's
+  multiboot info structure uses, which the memory-map work will need to read.
+  No caller yet; they are `unsafe fn` because a raw pointer walk cannot be
+  checked by the compiler.
+- `utoa` — render a `u32` in decimal into a caller-provided buffer, no heap,
+  no `core::fmt`. This one is live: `kmain` prints "42" by actually computing
+  `utoa(42, &mut buf)`.
+
+The punchline is what the optimiser did with that: `utoa(42)` is a pure
+function of a constant, so LLVM evaluated the whole digit loop at compile
+time. The linked binary is byte-for-byte identical to the previous commit's —
+same two immediate stores of `'4'` and `'2'` ([VGA.md](VGA.md)). The helper is
+real, exercised on the mandatory path, and free.
 
 ### `kernel/src/vga.rs` — the screen driver
 
@@ -424,11 +451,14 @@ ended up and what the screen holds:
 
 1. Start QEMU with no window and a control socket:
    `-display none -monitor unix:/tmp/kfs-mon,server,nowait`.
-2. Wait 5 s.
-3. `printf 'info registers\nscreendump build/screen.ppm\nquit\n' | socat -
-   unix-connect:/tmp/kfs-mon`.
-4. Pull out `EIP` and require it to be at or above `0x100000`.
-5. Require the frame dump to contain pure-white pixels (the "42" glyphs) and
+2. Poll `info registers` over the socket every 2 s, for up to 60 s, until
+   `EIP` is at or above `0x100000`. A fixed sleep proved flaky: boot takes a
+   few seconds natively but can take three times that inside the emulated
+   dev container, and the check must not care which host it runs on.
+3. Dump the frame with `screendump`, retrying for up to 10 s while it still
+   shows GRUB's text — qemu repaints its display surface on its own timer,
+   so a dump taken milliseconds after the kernel's writes can predate them.
+4. Require the final frame to contain pure-white pixels (the "42" glyphs) and
    none of GRUB's grey `#a8a8a8` (proof the clear ran) —
    [VGA.md](VGA.md#how-it-is-verified) details why that pair of greps is
    sound.

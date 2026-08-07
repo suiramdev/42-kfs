@@ -21,7 +21,8 @@ assembly, a linker script, or a bootloader.
 Working and measured: a 32-bit x86 kernel that GRUB loads from a 5 MB ISO and
 runs at address 1 MiB — an assembly boot stub plus a `no_std` Rust kernel,
 linked with our own linker script — which clears the screen and displays the
-mandatory "42" ([VGA.md](VGA.md)).
+mandatory "42" ([VGA.md](VGA.md)), computed through the first pieces of a
+kernel library (`utoa`, plus C-string helpers for the multiboot data to come).
 
 Not built yet: scrolling, colours, keyboard input (the subject's bonuses);
 interrupts, our own segment table and paging come after.

@@ -52,7 +52,10 @@ compiler — see `volatile` below.
     starting at cell 0, incrementing the index. Non-ASCII bytes go through
     as-is and render as code page 437 glyphs. Output past cell 1999 is dropped;
     no wrapping or scrolling exists yet.
-- **`kmain`:** `vga::clear(); vga::print("42");` before the idle `loop`.
+- **`kmain`:** `vga::clear()`, then print "42" — computed through
+  `klib::utoa(42, &mut buf)` rather than written as a literal, so the kernel
+  library's number formatting is exercised on the mandatory path. As the
+  disassembly below shows, the optimiser folds the difference away entirely.
 
 ### What the compiler made of it
 
@@ -74,11 +77,14 @@ its idle loop and alignment padding):
 
 `clear()` became a counted loop storing `0x0F20` (white-on-black space) into
 all 2 000 cells — the negative starting index is just the optimiser's way of
-making the loop end when `eax` hits zero. `print("42")` was unrolled completely:
+making the loop end when `eax` hits zero. The print was unrolled completely:
 two immediate stores of `0x0F34` and `0x0F32` straight into `0xb8000` and
-`0xb8002`. The string `"42"` never even reached `.rodata`; the section stayed
-empty. And the `volatile` contract held: every store is present, in order,
-none merged — the optimiser reshaped the *loop*, never the *writes*.
+`0xb8002`. Not only did the string never reach `.rodata` (the section stayed
+empty) — the text is not even a string in the source. `kmain` calls
+`klib::utoa(42, ...)`, and LLVM evaluated the whole digit-extraction loop at
+compile time, down to the same two stores a literal `"42"` produced. And the
+`volatile` contract held: every store is present, in order, none merged — the
+optimiser reshaped everything *around* the writes, never the writes.
 
 ## Later, for the bonus part
 
