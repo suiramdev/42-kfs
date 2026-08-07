@@ -48,38 +48,53 @@ run: $(NAME)
 	$(QEMU) -cdrom $(NAME)
 
 # Headless boot proof, asked from outside via the qemu monitor:
-#   1. the guest must still be alive after 5 s with EIP inside the kernel
-#      (>= 1 MiB), i.e. GRUB loaded the multiboot binary and kmain spins
-#      instead of the machine triple-faulting and rebooting;
+#   1. the guest must reach EIP inside the kernel (>= 1 MiB) — GRUB loaded
+#      the multiboot binary and kmain runs instead of the machine
+#      triple-faulting and rebooting. Polled rather than a fixed sleep:
+#      boot takes ~4 s natively but can take >5 s inside an emulated
+#      container, so we retry every 2 s for up to 60 s.
 #   2. a frame dump must contain white pixels (the "42" glyphs, attribute
 #      0x0F) and none of GRUB's grey #a8a8a8 leftovers (vga::clear ran).
 # The dump holds only black and white pixels, so grepping the raw P6 byte
 # stream for the two colour triples cannot false-positive across pixels.
 check: $(NAME)
-	@rm -f /tmp/kfs-mon $(BUILD)/regs.txt $(BUILD)/screen.ppm
+	@rm -f /tmp/kfs-mon $(BUILD)/screen.ppm
 	@$(QEMU) -cdrom $(NAME) -display none \
 		-monitor unix:/tmp/kfs-mon,server,nowait & echo $$! > $(BUILD)/qemu.pid
-	@sleep 5
-	@printf 'info registers\nscreendump $(BUILD)/screen.ppm\nquit\n' \
-		| socat - unix-connect:/tmp/kfs-mon > $(BUILD)/regs.txt \
+	@eip=; for i in $$(seq 1 30); do \
+		sleep 2; \
+		eip=$$(printf 'info registers\n' \
+			| socat - unix-connect:/tmp/kfs-mon 2>/dev/null \
+			| sed -n 's/.*EIP=\([0-9a-fA-F]*\).*/\1/p' | head -1); \
+		test -n "$$eip" && test $$((0x$$eip)) -ge $$((0x100000)) && break; \
+	done; \
+	test -n "$$eip" \
 		|| { echo "FAIL: qemu monitor unreachable (guest died)"; \
-		     kill $$(cat $(BUILD)/qemu.pid) 2>/dev/null; exit 1; }
-	@kill $$(cat $(BUILD)/qemu.pid) 2>/dev/null || true
-	@eip=$$(sed -n 's/.*EIP=\([0-9a-fA-F]*\).*/\1/p' $(BUILD)/regs.txt | head -1); \
-	test -n "$$eip" || { echo "FAIL: no EIP in monitor output"; exit 1; }; \
+		     kill $$(cat $(BUILD)/qemu.pid) 2>/dev/null; exit 1; }; \
 	test $$((0x$$eip)) -ge $$((0x100000)) \
-		|| { echo "FAIL: EIP=$$eip is below 1 MiB, kernel not running"; exit 1; }; \
+		|| { echo "FAIL: EIP=$$eip still below 1 MiB after 60 s"; \
+		     kill $$(cat $(BUILD)/qemu.pid) 2>/dev/null; exit 1; }; \
 	echo "OK: guest alive, EIP=$$eip inside kernel"
-	@test -s $(BUILD)/screen.ppm \
-		|| { echo "FAIL: no screen dump produced"; exit 1; }
-	@pixels=$$(od -An -v -tx1 $(BUILD)/screen.ppm | tr -d ' \n'); \
-	case $$pixels in *a8a8a8*) \
-		echo "FAIL: GRUB's grey text still on screen, vga::clear did not run"; \
-		exit 1;; esac; \
-	case $$pixels in *ffffff*) ;; *) \
-		echo "FAIL: no white pixels on screen, \"42\" not displayed"; \
-		exit 1;; esac; \
-	echo "OK: screen cleared and \"42\" glyphs lit"
+	@state=none; for i in $$(seq 1 10); do \
+		printf 'screendump $(BUILD)/screen.ppm\n' \
+			| socat - unix-connect:/tmp/kfs-mon > /dev/null 2>&1; \
+		pixels=$$(od -An -v -tx1 $(BUILD)/screen.ppm 2>/dev/null | tr -d ' \n'); \
+		case $$pixels in \
+		*a8a8a8*) state=grey;; \
+		*ffffff*) state=ok; break;; \
+		'') state=none;; \
+		*) state=black;; \
+		esac; \
+		sleep 1; \
+	done; \
+	printf 'quit\n' | socat - unix-connect:/tmp/kfs-mon > /dev/null 2>&1; \
+	kill $$(cat $(BUILD)/qemu.pid) 2>/dev/null || true; \
+	case $$state in \
+	ok) echo "OK: screen cleared and \"42\" glyphs lit";; \
+	grey) echo "FAIL: GRUB's grey text still on screen, vga::clear did not run"; exit 1;; \
+	black) echo "FAIL: no white pixels on screen, \"42\" not displayed"; exit 1;; \
+	*) echo "FAIL: no screen dump produced"; exit 1;; \
+	esac
 
 clean:
 	rm -rf $(BUILD)
