@@ -44,17 +44,23 @@ Working:
 - `printk!` — `core`'s whole formatting engine hooked onto the screen through
   one trait impl. Panics now print themselves in red instead of silently
   freezing the machine.
+- A polled PS/2 keyboard driver: after the banner, `kmain` echoes what you
+  type — Shift, Enter and Backspace included.
+- Three virtual screens, switched with F1/F2/F3, each keeping its own
+  contents, cursor and colour while off-screen.
 - A custom compilation target: 32-bit x86, no floating-point hardware, no OS
   underneath.
 - A linker script placing the kernel at 1 MiB with the multiboot header first.
-- A bootable GRUB ISO, 5 083 136 bytes (the subject's limit is 10 MiB).
+- A bootable GRUB ISO, 5 085 184 bytes (the subject's limit is 10 MiB).
 - `make check`, which proves the kernel is really executing *and* really drew
   "42" on the screen.
 
 Deliberately absent:
 
-- Interrupt handling, our own segment table, paging, keyboard, serial port, a
-  memory allocator, user space. None of it is needed to boot and print.
+- Interrupt handling, our own segment table, paging, a serial port, a memory
+  allocator, user space. None of it is needed to boot, print and echo keys —
+  though interrupts are what will turn the keyboard from polled to
+  event-driven in the next KFS.
 
 ## 3. Power-on to `kmain`
 
@@ -72,9 +78,9 @@ graph TD
     F --> G[GRUB scans the first 8 KiB of kernel.bin<br/>for the magic number 0x1BADB002]
     G --> H[Switches the CPU to 32-bit protected mode,<br/>copies our code to its load address]
     H --> I[Jumps to the ELF entry point 0x100010 = _start]
-    I --> J[_start: mov esp, 0x104360]
+    I --> J[_start: mov esp, 0x104690]
     J --> K[call kmain]
-    K --> L[kmain: clear the screen, print 42 and kfs-1,<br/>then idle forever]
+    K --> L[kmain: clear the screen, print 42 and kfs-1,<br/>then poll the keyboard forever]
 ```
 
 Only three links in that chain are ours: the magic number GRUB looks for, the
@@ -103,7 +109,7 @@ order to run at all. "The stack does not exist yet" is not a state Rust can
 express. That single problem is the entire reason there is an assembly file in
 this repo.
 
-## 4. The eight files that are the project
+## 4. The files that are the project
 
 Everything else is documentation or build plumbing.
 
@@ -162,7 +168,7 @@ literal array of 16 384 zeros compiled into the binary. x86 stacks grow
 
 ```
 00100010 <_start>:
-  100010: bc 60 43 10 00    mov  $0x104360,%esp
+  100010: bc 90 46 10 00    mov  $0x104690,%esp
   100015: e8 06 00 00 00    call 100020 <kmain>
 
 0010001a <_start.hang>:
@@ -171,8 +177,8 @@ literal array of 16 384 zeros compiled into the binary. x86 stacks grow
   10001c: eb fc             jmp  10001a
 ```
 
-`0x104360` is `stack_top` after the linker resolved it: `stack_bottom` at
-`0x100360` plus 16 384. The hang loop below the `call` is unreachable while
+`0x104690` is `stack_top` after the linker resolved it: `stack_bottom` at
+`0x100690` plus 16 384. The hang loop below the `call` is unreachable while
 `kmain` never returns, but it is the right thing to have there: `cli` switches
 interrupts off, `hlt` stops the CPU until one arrives anyway, and the `jmp`
 re-halts if something wakes it. Halting is not spinning — `hlt` lets a physical
@@ -190,6 +196,7 @@ silent build.
 ```rust
 #![no_std]
 
+mod keyboard;
 mod klib;
 mod printk;
 mod vga;
@@ -205,7 +212,14 @@ pub extern "C" fn kmain() -> ! {
     vga::set_color(vga::Color::BrightGreen, vga::Color::Black);
     printk!("kfs-{}\n", 1);
     vga::set_color(vga::Color::White, vga::Color::Black);
-    loop { core::hint::spin_loop(); }
+    loop {
+        match keyboard::poll() {
+            Some(keyboard::Key::Char(b)) => vga::put_char(b),
+            Some(keyboard::Key::Backspace) => vga::backspace(),
+            Some(keyboard::Key::Screen(n)) => vga::switch_screen(n),
+            None => core::hint::spin_loop(),
+        }
+    }
 }
 
 #[panic_handler]
@@ -228,8 +242,9 @@ Read against what you already know:
 
 `core::hint::spin_loop()` emits the x86 `pause` instruction — a hint that this
 loop is waiting on something, which saves power and avoids a pipeline penalty.
-The optimiser inlines the whole driver into `kmain`, which compiles to 804
-bytes ending in the `pause; jmp` idle pair the check finds `EIP` parked on.
+After the banner, `kmain` *is* that loop: ask the keyboard, echo the answer,
+pause. The optimiser inlines every driver into `kmain`, and the check finds
+`EIP` somewhere inside the loop's ~1.3 KB whenever it samples the guest.
 
 The panic handler prints the panic — location, message, formatted values — in
 bright red before idling, which turns the failure mode from "screen freezes"
@@ -244,9 +259,9 @@ into an actual error report. Two things worth knowing about it:
   `debug_assert!`, `utoa` cannot fail, the one `printk!` folds at compile
   time), so the whole handler — and with it all of `core::fmt`'s machinery —
   is dead code and gets dropped. Introduce a real `panic!` and it all comes
-  back: measured by temporarily panicking in `kmain`, which grew
-  `kernel.bin` from 2 016 to 7 044 bytes and printed
-  `panicked at src/lib.rs:21:5` in red on boot.
+  back: measured by temporarily panicking in `kmain` (at the commit that
+  added printk), which grew `kernel.bin` from 2 016 to 7 044 bytes and
+  printed `panicked at src/lib.rs:21:5` in red on boot.
 
 ### `kernel/src/klib.rs` — the start of a kernel library
 
@@ -285,6 +300,20 @@ This is the classic Rust-kernel move — the standard library's I/O is gone,
 but the *language-level* machinery (traits, `format_args!`) never depended on
 an OS in the first place.
 
+### `kernel/src/keyboard.rs` — asking the keyboard instead of listening
+
+The PS/2 keyboard does not send characters. Its 8042 controller (status port
+`0x64`, data port `0x60`) delivers **scancodes** — numbers naming physical key
+positions, press and release separately — and turning those into ASCII against
+a layout table is the driver's whole job. Shift is just two more scancodes
+whose press/release toggles a flag; F1-F3 come back as "switch screen"
+commands rather than characters.
+
+Polled, not interrupt-driven: `kmain` asks "anything for me?" (status bit 0)
+on every lap of its loop, because the alternative — the keyboard interrupting
+the CPU — needs an IDT, which is the next KFS project. Polling burns the CPU
+politely (`pause`) and loses nothing at human typing speed.
+
 ### `kernel/src/vga.rs` — the screen driver
 
 The screen is not a device you ask politely: it is 4 000 bytes of memory at
@@ -292,12 +321,16 @@ The screen is not a device you ask politely: it is 4 000 bytes of memory at
 module writes u16 cells (colour byte + ASCII byte) into it through
 `core::ptr::write_volatile` — `volatile` because these stores are never read
 back, and a store whose result is unused is exactly what an optimiser deletes.
-Three public entry points — `clear()`, `set_color(fg, bg)`, `print(&str)` —
-over a tracked write position: `\n`, wrapping at column 80, scrolling at the
-bottom row, and the blinking hardware cursor re-parked after each print
-through the CRT controller's I/O ports (the kernel's only inline `asm!`).
-The full story — the cell format, why `volatile`, the port I/O — is
-[VGA.md](VGA.md).
+Public entry points — `clear()`, `set_color(fg, bg)`, `print(&str)`,
+`put_char(u8)`, `backspace()`, `switch_screen(n)` — over a tracked write
+position: `\n`, wrapping at column 80, scrolling at the bottom row, and the
+blinking hardware cursor re-parked after each print through the CRT
+controller's I/O ports. Three virtual screens live behind it: the active one
+exists only in the real buffer at `0xb8000`; switching copies the live 4 000
+bytes into the leaving screen's save slot and the entering screen's slot back
+— contents, cursor and colour all travel. The full story — the cell format,
+why `volatile`, the port I/O, the `.bss` trick that keeps 12 KiB of screen
+slots out of the binary — is [VGA.md](VGA.md).
 
 ### `linker.ld` — where the code lands in RAM
 
@@ -334,14 +367,17 @@ The result:
 | Section | Address | Size | Notes |
 |---|---|---|---|
 | `.multiboot` | `0x100000` | 12 B | magic, flags, checksum |
-| `.text` | `0x100010` | 820 B | `_start` and `kmain` with the whole driver inlined |
-| `.rodata` | `0x100344` | 6 B | one string: `"kfs-1\n"` — the "42" is computed, never stored |
-| `.bss` | `0x100360` | 16 KiB + 8 B | the stack, then the driver's cursor and colour; never stored on disk |
+| `.text` | `0x100010` | 1 381 B | `_start` and `kmain` with every driver inlined |
+| `.rodata` | `0x100528` | 266 B | the two 58-byte scancode tables, `"kfs-1\n"`, alignment |
+| `.data` | `0x100682` | 2 B | compiler leftovers |
+| `.bss` | `0x100690` | 27.8 KiB | the stack (16 KiB), three screen save slots (12 KiB), driver state; never stored on disk |
 
-`.data` is empty and gets dropped. The ELF ends up with a single loadable
-chunk: 856 bytes on disk expanding to 17 256 bytes in RAM, the difference
-being the `.bss` the loader must provide but never reads from the file.
-`build/kernel.bin` is 2 016 bytes total; the rest is ELF bookkeeping.
+The ELF ends up with a single loadable chunk: 1 680 bytes on disk expanding
+to 30 101 bytes in RAM, the difference being the `.bss` the loader must
+provide but never reads from the file — including the three 4 KiB screen
+slots, kept deliberately zero-initialised so they cost nothing on disk
+([VGA.md](VGA.md)). `build/kernel.bin` is 3 112 bytes total; the rest is ELF
+bookkeeping.
 
 The link command:
 
@@ -408,9 +444,9 @@ required because rebuilding `core` is an unstable feature — pinned in
 
 `Cargo.toml` asks for `lto = true` with a single codegen unit: whole-program
 link-time optimisation is what lets the compiler prove `core::fmt`'s
-machinery unreachable today and drop it — without it, linking in `printk`
-took `kernel.bin` from 2 KB to 430 KB; with it, back to 2 016 bytes (see the
-panic handler notes above). And it asks for `crate-type = ["staticlib"]`, so cargo produces
+machinery unreachable today and drop it — measured when `printk` landed:
+2 KB to 430 KB without LTO, back to 2 KB with it (see the panic handler
+notes above). And it asks for `crate-type = ["staticlib"]`, so cargo produces
 `libkernel.a` (748 246 bytes) instead of an executable: a bag of parts for our
 own `ld` invocation to assemble, rather than a finished program linked with the
 wrong script. `panic = "abort"` in both profiles strips the unwinding machinery,
@@ -438,12 +474,12 @@ control. The path is inside the ISO, not on your machine — `make` stages
 
 ```
 boot/boot.asm ──nasm -f elf32──────────────► build/boot.o        (928 B)
-kernel/src/*  ──cargo build --release──────► libkernel.a         (339 KB)
-both          ──ld -m elf_i386 -n -T ...───► build/kernel.bin    (2 016 B)
-kernel.bin    ──grub-mkrescue──────────────► kfs.iso             (5 083 136 B)
+kernel/src/*  ──cargo build --release──────► libkernel.a         (341 KB)
+both          ──ld -m elf_i386 -n -T ...───► build/kernel.bin    (3 112 B)
+kernel.bin    ──grub-mkrescue──────────────► kfs.iso             (5 085 184 B)
 ```
 
-A 2 KB kernel produces a 5 MB image because `grub-mkrescue` copies GRUB itself
+A 3 KB kernel produces a 5 MB image because `grub-mkrescue` copies GRUB itself
 and its entire module tree — 294 files in this build — onto the ISO.
 
 Worth knowing:
@@ -469,6 +505,10 @@ Worth knowing:
 Boot the ISO and you get a black screen with a white "42" on the first row, a
 bright-green "kfs-1" on the second, and a blinking cursor at row 2, column 0.
 Each part has a cause:
+
+Type, and it echoes where the cursor blinks — Shift, Enter, Backspace all
+behave; F1/F2/F3 switch between three independent screens. Each part of the
+boot picture has a cause:
 
 1. **The black screen** is `vga::clear()`: 2 000 cells overwritten with a
    white-on-black space, erasing the grey text GRUB printed while loading.
@@ -503,9 +543,11 @@ ended up and what the screen holds:
 1. Start QEMU with no window and a control socket:
    `-display none -monitor unix:/tmp/kfs-mon,server,nowait`.
 2. Poll `info registers` over the socket every 2 s, for up to 60 s, until
-   `EIP` is at or above `0x100000`. A fixed sleep proved flaky: boot takes a
-   few seconds natively but can take three times that inside the emulated
-   dev container, and the check must not care which host it runs on.
+   `EIP` lands inside `[0x100000, 0x200000)`. A fixed sleep proved flaky:
+   boot takes a few seconds natively but can take three times that inside
+   the emulated dev container. Both bounds are needed — GRUB runs below
+   1 MiB *and*, relocated, near the top of RAM (`EIP=0x07f7d106` was
+   observed mid-boot), so "at least 1 MiB" alone can pass too early.
 3. Dump the frame with `screendump`, retrying for up to 10 s while it still
    shows GRUB's text — qemu repaints its display surface on its own timer,
    so a dump taken milliseconds after the kernel's writes can predate them.
@@ -519,13 +561,13 @@ answer at all, the instruction pointer is inside the kernel's address range,
 and the kernel's writes really reached the VGA buffer.
 
 ```
-OK: kfs.iso is 5083136 bytes (limit 10485760)
-OK: guest alive, EIP=00100342 inside kernel
+OK: kfs.iso is 5085184 bytes (limit 10485760)
+OK: guest alive, EIP=001002fa inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
 
-`kmain` occupies `0x100020`-`0x100344` and ends in its idle loop, so
-`EIP=0x100342` is parked on that loop's `jmp`. GRUB accepted the header,
+`kmain` occupies `0x100020`-`0x100585`; the exact `EIP` depends on where in
+the keyboard-polling loop the sample lands. GRUB accepted the header,
 `_start` set `esp`, Rust ran the VGA writes to completion, and the machine is
 not rebooting in a loop.
 

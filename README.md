@@ -1,8 +1,9 @@
 # kfs-1
 
-A kernel that boots on a bare 32-bit x86 PC and displays "42": an assembly boot
-stub, a `no_std` Rust kernel with a VGA text driver, our own linker script,
-packaged as a bootable GRUB ISO.
+A kernel that boots on a bare 32-bit x86 PC, displays "42" and echoes your
+keyboard across three virtual screens: an assembly boot stub, a `no_std` Rust
+kernel with VGA and PS/2 drivers, our own linker script, packaged as a bootable
+GRUB ISO.
 
 "Kernel" means the software that would normally be *underneath* your program —
 the thing `printf` and `malloc` are asking for help from. There is nothing
@@ -62,7 +63,9 @@ make re       # fclean + all
 `make run` opens a qemu window showing a black screen with a white "42" on the
 first row, a bright-green "kfs-1" on the second, and the blinking hardware
 cursor parked right after — the driver moves it through I/O ports after every
-print ([docs/VGA.md](docs/VGA.md)).
+print ([docs/VGA.md](docs/VGA.md)). Click into the window and type: characters
+echo at the cursor (Shift, Enter, Backspace all work) and F1/F2/F3 switch
+between three independent screens.
 
 The eyeball test is not the proof, though — `make check` is. You cannot
 `assert` from inside a kernel — no test harness, no exit status, nowhere to
@@ -73,19 +76,21 @@ the qemu monitor for `info registers` until the kernel is reached (up to 60 s
 dump:
 
 ```
-OK: kfs.iso is 5083136 bytes (limit 10485760)
-OK: guest alive, EIP=00100342 inside kernel
+OK: kfs.iso is 5085184 bytes (limit 10485760)
+OK: guest alive, EIP=001002fa inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
 
 Three facts have to hold: qemu is still alive to answer, the instruction
-pointer is at or above 1 MiB where the kernel was loaded, and the dumped frame
-shows white pixels (the "42" glyphs) with none of GRUB's grey `#a8a8a8`
-leftovers (so our clear really overwrote the screen). `kmain` links at
-`0x100030` (`nm build/kernel.bin`); `EIP=0x100342` is parked on the `jmp` of
-its idle loop, after the screen writes. That means GRUB accepted our binary,
-`_start` set up a stack, and Rust ran to the end of `kmain`'s work. An
-unreachable monitor, or an `EIP` below 1 MiB, means the guest died.
+pointer is inside the kernel (within [1 MiB, 2 MiB) — GRUB executes both below
+1 MiB and, relocated, near the top of RAM, so a lower bound alone is not
+enough), and the dumped frame shows white pixels (the "42" glyphs) with none
+of GRUB's grey `#a8a8a8` leftovers (so our clear really overwrote the screen).
+`kmain` links at `0x100020` (`nm build/kernel.bin`) and spends its life in the
+keyboard-polling loop, which is where `EIP` lands. That means GRUB accepted
+our binary, `_start` set up a stack, and Rust ran the screen writes to
+completion. An unreachable monitor, or an `EIP` outside the kernel, means the
+guest died or never arrived.
 
 ## Build on a host without an x86 toolchain (e.g. macOS/arm64)
 

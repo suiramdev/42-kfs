@@ -158,8 +158,22 @@ to it changes hardware instead of storing a value. The VGA text screen at
 must not optimise away a write whose whole point is the side effect.
 
 **Port I/O** — x86's other way of reaching devices, using `in` and `out`
-instructions on a separate, small address space of its own. How the driver
-parks the hardware cursor (ports `0x3D4`/`0x3D5`).
+instructions on a separate, small address space of its own. Here: the hardware
+cursor (ports `0x3D4`/`0x3D5`) and the PS/2 keyboard (status `0x64`, data
+`0x60`).
+
+**PS/2 / 8042** — the classic PC keyboard interface and the controller chip
+behind it. QEMU emulates one regardless of your real keyboard. It hands out
+scancodes, never characters.
+
+**Scancode** — the number a keyboard sends for a physical key *position*:
+press and release are separate codes (release = press | 0x80), and "which
+character is that" is a layout decision the kernel makes with a lookup table.
+Here: `kernel/src/keyboard.rs`, US QWERTY, set 1.
+
+**Polling** — asking a device "anything new?" in a loop, as opposed to the
+device raising an interrupt when something happens. Wasteful but simple, and
+the only option before an IDT exists. Here: `kmain`'s keyboard loop.
 
 **VGA text mode** — the 80×25 grid of characters a PC starts up in. Each cell is
 two bytes at `0xb8000`: a character code and a colour attribute. Here: driven
@@ -188,7 +202,7 @@ which is why the multiboot magic `0x1BADB002` appears in the binary as
 through `ESP`. Nobody hands a kernel one; it reserves memory and points `ESP` at
 it. On x86 the stack grows *downwards*, so the initial pointer is the *highest*
 address of the reserved region. Here: 16 KiB in `.bss`, with `esp` starting at
-`stack_top` = `0x104360`.
+`stack_top` = `0x104690`.
 
 ---
 
@@ -304,7 +318,7 @@ to produce a 32-bit ELF object.
 **Mnemonic** — the human-readable name of an instruction: `mov`, `call`, `jmp`.
 
 **Opcode / machine code** — the actual bytes the CPU executes.
-`mov esp, 0x104360` is `bc 60 43 10 00`.
+`mov esp, 0x104690` is `bc 90 46 10 00`.
 
 **Label** — a name for an address (`_start:`, `stack_top:`). In NASM a label
 beginning with `.` belongs to the previous global label, which is why the hang
@@ -420,7 +434,7 @@ off.
 
 **Segment / program header** — the loader's view of an ELF: which byte ranges to
 copy to which addresses with which permissions. Our kernel has one `LOAD`
-segment, 856 bytes on disk expanding to 17 256 in RAM.
+segment, 1 680 bytes on disk expanding to 30 101 in RAM.
 
 **Static library / archive (`.a`)** — a bundle of object files in one file.
 `cargo` emits `libkernel.a` — a bag of parts rather than a finished program — so

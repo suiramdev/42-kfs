@@ -24,13 +24,14 @@ linked with our own linker script — which clears the screen and displays the
 mandatory "42" ([VGA.md](VGA.md)), computed through the first pieces of a
 kernel library (`utoa`, plus C-string helpers for the multiboot data to come).
 
-Most bonuses are in too: colours, a tracked cursor with wrapping and
-scrolling, the blinking hardware cursor driven through I/O ports, and
-`printk!` — `core`'s formatting engine hooked onto the screen, which also
-lets panics print themselves in red.
+All the subject's bonuses are in too: colours, a tracked cursor with wrapping
+and scrolling, the blinking hardware cursor driven through I/O ports,
+`printk!` — `core`'s formatting engine hooked onto the screen, which also lets
+panics print themselves in red — a polled PS/2 keyboard that echoes what you
+type, and three virtual screens on F1/F2/F3.
 
-Not built yet: keyboard input and multiple screens (the remaining bonuses);
-interrupts, our own segment table and paging come after.
+Not built yet: interrupts (what would make the keyboard event-driven instead
+of polled), our own segment table, paging. Those are the next KFS projects.
 
 ## Reading order
 
@@ -42,6 +43,7 @@ it goes.
 **Just want to build and run it?** That is the [root README](../README.md).
 
 **Wondering what the screen should show?** A black screen, a white "42", a
-green "kfs-1", and the blinking cursor parked right after.
+green "kfs-1", the blinking cursor parked right after — and your keystrokes
+echoed once you type.
 [ARCHITECTURE.md §5](ARCHITECTURE.md#5-what-the-screen-shows) explains each
 part, with measurements.

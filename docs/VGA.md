@@ -1,10 +1,11 @@
 # Screen output
 
 The subject requires the kernel to display "42". It does — white on black, with
-a bright-green "kfs-1" underneath — and the driver behind it covers most of the
-subject's bonuses: colours, a tracked cursor with line wrapping, scrolling, and
-the `printk!` formatter built on top ([ARCHITECTURE.md](ARCHITECTURE.md) covers
-that last one). This file explains what "the screen" actually is on this machine,
+a bright-green "kfs-1" underneath — and the driver behind it covers all of the
+subject's bonuses: colours, a tracked cursor with line wrapping, scrolling, the
+`printk!` formatter built on top ([ARCHITECTURE.md](ARCHITECTURE.md) covers that
+one), a polled PS/2 keyboard that echoes what you type, and three virtual
+screens on F1/F2/F3. This file explains what "the screen" actually is on this machine,
 how `kernel/src/vga.rs` drives it, and how the result is verified.
 
 ## What "the screen" actually is here
@@ -69,7 +70,25 @@ compiler — see `volatile` below.
   formatting engine. The macro itself lives in `kernel/src/printk.rs`.
 - **`kmain`:** clear, print "42" — computed through `klib::utoa(42, &mut buf)`
   rather than written as a literal, so the kernel library is exercised on the
-  mandatory path — then `printk!("kfs-{}\n", 1)` in bright green.
+  mandatory path — then `printk!("kfs-{}\n", 1)` in bright green. After the
+  banner it loops polling the keyboard: `put_char` echoes, `backspace()` steps
+  the cursor back and blanks the cell, F1-F3 call `switch_screen`.
+
+## Virtual screens
+
+There is one real screen — the 4 000 bytes at `0xb8000` — and three virtual
+ones. The active screen lives in the real buffer and *nowhere else*; each
+inactive screen is a save slot in `.bss`: the same 2 000 cells plus the cursor
+and colour that go with them. `switch_screen(n)` copies the live buffer into
+the leaving screen's slot and the entering slot into the buffer, so contents,
+colours and cursor position all survive a round trip untouched.
+
+One deliberate detail: the slots are zero-initialised, with a `USED` flag
+marking which ever held a real screen (first entry into a fresh screen blanks
+it on the spot). Initialising the slots to "blank cells" in the source instead
+would move all 12 KiB from `.bss` (free: the loader provides zeroed memory)
+into `.data` (stored byte-for-byte in the file) — measured, that mistake cost
++12 KiB of `kernel.bin` for three screens full of spaces.
 
 ## The hardware cursor
 
@@ -88,18 +107,19 @@ makes the screen read like a terminal.
 
 ## Proven behaviour
 
-Booted and frame-dumped (the scroll/wrap proof ran a throwaway `kmain` that
-printed 33 lines and a 200-character line):
+All frame-dumped over the QEMU monitor; the keyboard runs were driven with its
+`sendkey` command, which injects real scancodes into the emulated 8042 —
+keystrokes without fingers:
 
 - 30 numbered lines on a 25-row screen leave lines 9-30 on screen: the top
-  scrolled away, the bottom kept.
+  scrolled away, the bottom kept (throwaway `kmain`, 33 lines printed).
 - A 200-character line folds at column 80 across three rows.
 - The cursor sits exactly after the last character printed.
 - Colours travel with their cells when the screen scrolls.
-
-## Later, for the bonus part
-
-Keyboard input, and multiple virtual screens with shortcuts to switch.
+- Typed `hello World!` — Shift produced `W` and `!`, Enter opened a line,
+  Backspace erased: `x` remained of `xy`.
+- F2 revealed a fresh blank screen; text typed there stayed there; F1 brought
+  back the first screen bit-for-bit, banner colours and cursor included.
 
 ## How it is verified
 
@@ -126,7 +146,7 @@ restated in the Makefile next to the check.
 A successful run prints:
 
 ```
-OK: guest alive, EIP=00100342 inside kernel
+OK: guest alive, EIP=001002fa inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
 
