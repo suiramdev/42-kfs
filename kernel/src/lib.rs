@@ -2,6 +2,7 @@
 
 use core::panic::PanicInfo;
 
+mod keyboard;
 mod klib;
 mod printk;
 mod vga;
@@ -9,6 +10,11 @@ mod vga;
 use printk::printk;
 
 /// Kernel entry point, called from `_start` in `boot/boot.asm`.
+///
+/// After the banner, `kmain` becomes a dumb terminal: poll the
+/// keyboard, echo what it says. Busy-polling is the honest option
+/// today — waking on a key press instead takes interrupts, which is
+/// the next KFS project.
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     vga::clear();
@@ -19,7 +25,12 @@ pub extern "C" fn kmain() -> ! {
     printk!("kfs-{}\n", 1);
     vga::set_color(vga::Color::White, vga::Color::Black);
     loop {
-        core::hint::spin_loop();
+        match keyboard::poll() {
+            Some(keyboard::Key::Char(b)) => vga::put_char(b),
+            Some(keyboard::Key::Backspace) => vga::backspace(),
+            Some(keyboard::Key::Screen(n)) => vga::switch_screen(n),
+            None => core::hint::spin_loop(),
+        }
     }
 }
 

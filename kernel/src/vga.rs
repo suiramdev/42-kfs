@@ -43,10 +43,41 @@ pub enum Color {
     White = 15,
 }
 
+const DEFAULT_ATTR: u16 = (Color::White as u16) << 8;
+
 /// Next cell `putb` writes to, always < `CELLS`.
 static mut CURSOR: usize = 0;
 /// Current colour, pre-shifted into the attribute byte position.
-static mut ATTR: u16 = (Color::White as u16) << 8;
+static mut ATTR: u16 = DEFAULT_ATTR;
+
+/// How many virtual screens F1/F2/F3 switch between.
+pub const NB_SCREENS: usize = 3;
+
+/// A virtual screen while it is *not* displayed: the same 2 000 cells
+/// the VGA buffer holds, plus the cursor and colour that go with them.
+/// Only ever off-screen — the active screen lives in the real buffer
+/// at 0xb8000 and nowhere else.
+///
+/// All-zero on purpose: a zeroed static lives in `.bss`, which costs
+/// nothing in the binary — the loader provides the 12 KiB. Initialising
+/// the cells to blanks here instead would drag the whole array into
+/// `.data` and store every one of those spaces in the file (measured:
+/// +12 KiB of `kernel.bin`). `USED` says which slots hold a real saved
+/// screen; the others get blanked on first entry.
+struct Screen {
+    cells: [u16; CELLS],
+    cursor: usize,
+    attr: u16,
+}
+
+const ZERO: Screen = Screen {
+    cells: [0; CELLS],
+    cursor: 0,
+    attr: 0,
+};
+static mut SCREENS: [Screen; NB_SCREENS] = [ZERO; NB_SCREENS];
+static mut USED: [bool; NB_SCREENS] = [false; NB_SCREENS];
+static mut ACTIVE: usize = 0;
 
 fn cursor() -> usize {
     unsafe { CURSOR }
@@ -95,6 +126,57 @@ pub fn clear() {
 pub fn print(s: &str) {
     for b in s.bytes() {
         putb(b);
+    }
+    sync_hw_cursor();
+}
+
+/// Print one byte at the cursor — `print` for the keyboard's pace,
+/// where syncing the hardware cursor per byte costs nothing.
+pub fn put_char(b: u8) {
+    putb(b);
+    sync_hw_cursor();
+}
+
+/// Undo one character: step the cursor back and blank the cell. At the
+/// top-left there is nothing to undo.
+pub fn backspace() {
+    if cursor() > 0 {
+        set_cursor(cursor() - 1);
+        put_cell(cursor(), attr() | b' ' as u16);
+        sync_hw_cursor();
+    }
+}
+
+/// Make screen `n` the displayed one. The 4 000 live bytes move out of
+/// the VGA buffer into the leaving screen's save slot, the entering
+/// screen's slot moves in, and cursor + colour travel with each. Out of
+/// range or already active: no-op.
+pub fn switch_screen(n: usize) {
+    if n >= NB_SCREENS || n == unsafe { ACTIVE } {
+        return;
+    }
+    unsafe {
+        let a = ACTIVE;
+        for i in 0..CELLS {
+            SCREENS[a].cells[i] = read_cell(i);
+        }
+        SCREENS[a].cursor = CURSOR;
+        SCREENS[a].attr = ATTR;
+        USED[a] = true;
+        if USED[n] {
+            for i in 0..CELLS {
+                put_cell(i, SCREENS[n].cells[i]);
+            }
+            CURSOR = SCREENS[n].cursor;
+            ATTR = SCREENS[n].attr;
+        } else {
+            ATTR = DEFAULT_ATTR;
+            CURSOR = 0;
+            for i in 0..CELLS {
+                put_cell(i, DEFAULT_ATTR | b' ' as u16);
+            }
+        }
+        ACTIVE = n;
     }
     sync_hw_cursor();
 }
