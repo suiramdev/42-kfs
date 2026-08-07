@@ -55,8 +55,11 @@ run: $(NAME)
 #      container, so we retry every 2 s for up to 60 s.
 #   2. a frame dump must contain white pixels (the "42" glyphs, attribute
 #      0x0F) and none of GRUB's grey #a8a8a8 leftovers (vga::clear ran).
-# The dump holds only black and white pixels, so grepping the raw P6 byte
-# stream for the two colour triples cannot false-positive across pixels.
+# The colour greps scan the raw P6 byte stream, so they rely on the kernel
+# only drawing colours that render without 0xa8 or spurious 0xff bytes:
+# black, white and the bright half of the palette. The dim half (#00a800
+# green, #a80000 red, ...) could reassemble GRUB's grey across adjacent
+# pixel boundaries — keep it off the boot screen.
 check: $(NAME)
 	@rm -f /tmp/kfs-mon $(BUILD)/screen.ppm
 	@$(QEMU) -cdrom $(NAME) -display none \

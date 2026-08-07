@@ -11,6 +11,10 @@ pub extern "C" fn kmain() -> ! {
     vga::clear();
     let mut buf = [0u8; 10];
     vga::print(klib::utoa(42, &mut buf));
+    vga::print("\n");
+    vga::set_color(vga::Color::BrightGreen, vga::Color::Black);
+    vga::print("kfs-1\n");
+    vga::set_color(vga::Color::White, vga::Color::Black);
     loop {
         core::hint::spin_loop();
     }
