@@ -2,13 +2,15 @@
 
 use core::panic::PanicInfo;
 
+mod klib;
 mod vga;
 
 /// Kernel entry point, called from `_start` in `boot/boot.asm`.
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     vga::clear();
-    vga::print("42");
+    let mut buf = [0u8; 10];
+    vga::print(klib::utoa(42, &mut buf));
     loop {
         core::hint::spin_loop();
     }
