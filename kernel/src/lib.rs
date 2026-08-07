@@ -2,11 +2,13 @@
 
 use core::panic::PanicInfo;
 
+mod vga;
+
 /// Kernel entry point, called from `_start` in `boot/boot.asm`.
-///
-/// Screen output is not implemented yet — see `docs/VGA.md`.
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
+    vga::clear();
+    vga::print("42");
     loop {
         core::hint::spin_loop();
     }

@@ -47,15 +47,20 @@ $(NAME): $(KERNEL_BIN) grub.cfg
 run: $(NAME)
 	$(QEMU) -cdrom $(NAME)
 
-# Headless boot proof: the guest must still be alive after 5 s with EIP inside
-# the kernel (>= 1 MiB), i.e. GRUB loaded the multiboot binary and kmain spins
-# instead of the machine triple-faulting and rebooting.
+# Headless boot proof, asked from outside via the qemu monitor:
+#   1. the guest must still be alive after 5 s with EIP inside the kernel
+#      (>= 1 MiB), i.e. GRUB loaded the multiboot binary and kmain spins
+#      instead of the machine triple-faulting and rebooting;
+#   2. a frame dump must contain white pixels (the "42" glyphs, attribute
+#      0x0F) and none of GRUB's grey #a8a8a8 leftovers (vga::clear ran).
+# The dump holds only black and white pixels, so grepping the raw P6 byte
+# stream for the two colour triples cannot false-positive across pixels.
 check: $(NAME)
-	@rm -f /tmp/kfs-mon $(BUILD)/regs.txt
+	@rm -f /tmp/kfs-mon $(BUILD)/regs.txt $(BUILD)/screen.ppm
 	@$(QEMU) -cdrom $(NAME) -display none \
 		-monitor unix:/tmp/kfs-mon,server,nowait & echo $$! > $(BUILD)/qemu.pid
 	@sleep 5
-	@printf 'info registers\nquit\n' \
+	@printf 'info registers\nscreendump $(BUILD)/screen.ppm\nquit\n' \
 		| socat - unix-connect:/tmp/kfs-mon > $(BUILD)/regs.txt \
 		|| { echo "FAIL: qemu monitor unreachable (guest died)"; \
 		     kill $$(cat $(BUILD)/qemu.pid) 2>/dev/null; exit 1; }
@@ -65,6 +70,16 @@ check: $(NAME)
 	test $$((0x$$eip)) -ge $$((0x100000)) \
 		|| { echo "FAIL: EIP=$$eip is below 1 MiB, kernel not running"; exit 1; }; \
 	echo "OK: guest alive, EIP=$$eip inside kernel"
+	@test -s $(BUILD)/screen.ppm \
+		|| { echo "FAIL: no screen dump produced"; exit 1; }
+	@pixels=$$(od -An -v -tx1 $(BUILD)/screen.ppm | tr -d ' \n'); \
+	case $$pixels in *a8a8a8*) \
+		echo "FAIL: GRUB's grey text still on screen, vga::clear did not run"; \
+		exit 1;; esac; \
+	case $$pixels in *ffffff*) ;; *) \
+		echo "FAIL: no white pixels on screen, \"42\" not displayed"; \
+		exit 1;; esac; \
+	echo "OK: screen cleared and \"42\" glyphs lit"
 
 clean:
 	rm -rf $(BUILD)
