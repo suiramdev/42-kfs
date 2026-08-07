@@ -24,8 +24,11 @@ linked with our own linker script — which clears the screen and displays the
 mandatory "42" ([VGA.md](VGA.md)), computed through the first pieces of a
 kernel library (`utoa`, plus C-string helpers for the multiboot data to come).
 
-Not built yet: scrolling, colours, keyboard input (the subject's bonuses);
-interrupts, our own segment table and paging come after.
+The first bonuses are in too: colours, a tracked cursor with wrapping and
+scrolling, and the blinking hardware cursor driven through I/O ports.
+
+Not built yet: a `printk` formatter and keyboard input (the remaining
+bonuses); interrupts, our own segment table and paging come after.
 
 ## Reading order
 
@@ -36,7 +39,7 @@ it goes.
 
 **Just want to build and run it?** That is the [root README](../README.md).
 
-**Wondering what the screen should show?** A black screen, a white "42", and a
-blinking cursor GRUB left behind.
+**Wondering what the screen should show?** A black screen, a white "42", a
+green "kfs-1", and the blinking cursor parked right after.
 [ARCHITECTURE.md §5](ARCHITECTURE.md#5-what-the-screen-shows) explains each
 part, with measurements.

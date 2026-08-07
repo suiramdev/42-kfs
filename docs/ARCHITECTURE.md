@@ -34,15 +34,17 @@ Working:
 - An assembly boot stub that sets up a stack and calls into Rust.
 - A `no_std` Rust kernel whose entry point is `kmain`, plus the panic handler
   the language demands.
-- A VGA text driver — clear the screen, print a string — and `kmain` using it
-  to display "42". The screen model and the module are [VGA.md](VGA.md).
+- A VGA text driver — clear, print, colours, a tracked cursor with line
+  wrapping and scrolling, the blinking hardware cursor parked after our
+  output — and `kmain` using it to display "42" and a green "kfs-1". The
+  screen model and the module are [VGA.md](VGA.md).
 - The start of a kernel library: C-string helpers for the multiboot data GRUB
   hands us, and number-to-text conversion. The displayed "42" actually goes
   through it.
 - A custom compilation target: 32-bit x86, no floating-point hardware, no OS
   underneath.
 - A linker script placing the kernel at 1 MiB with the multiboot header first.
-- A bootable GRUB ISO, 5 083 136 bytes (the subject's limit is 10 MiB).
+- A bootable GRUB ISO, 5 085 184 bytes (the subject's limit is 10 MiB).
 - `make check`, which proves the kernel is really executing *and* really drew
   "42" on the screen.
 
@@ -67,9 +69,9 @@ graph TD
     F --> G[GRUB scans the first 8 KiB of kernel.bin<br/>for the magic number 0x1BADB002]
     G --> H[Switches the CPU to 32-bit protected mode,<br/>copies our code to its load address]
     H --> I[Jumps to the ELF entry point 0x100010 = _start]
-    I --> J[_start: mov esp, 0x104070]
+    I --> J[_start: mov esp, 0x104370]
     J --> K[call kmain]
-    K --> L[kmain: clear the screen, print 42,<br/>then idle forever]
+    K --> L[kmain: clear the screen, print 42 and kfs-1,<br/>then idle forever]
 ```
 
 Only three links in that chain are ours: the magic number GRUB looks for, the
@@ -157,7 +159,7 @@ literal array of 16 384 zeros compiled into the binary. x86 stacks grow
 
 ```
 00100010 <_start>:
-  100010: bc 70 40 10 00    mov  $0x104070,%esp
+  100010: bc 70 43 10 00    mov  $0x104370,%esp
   100015: e8 16 00 00 00    call 100030 <kmain>
 
 0010001a <_start.hang>:
@@ -166,8 +168,8 @@ literal array of 16 384 zeros compiled into the binary. x86 stacks grow
   10001c: eb fc             jmp  10001a
 ```
 
-`0x104070` is `stack_top` after the linker resolved it: `stack_bottom` at
-`0x100070` plus 16 384. The hang loop below the `call` is unreachable while
+`0x104370` is `stack_top` after the linker resolved it: `stack_bottom` at
+`0x100370` plus 16 384. The hang loop below the `call` is unreachable while
 `kmain` never returns, but it is the right thing to have there: `cli` switches
 interrupts off, `hlt` stops the CPU until one arrives anyway, and the `jmp`
 re-halts if something wakes it. Halting is not spinning — `hlt` lets a physical
@@ -193,6 +195,10 @@ pub extern "C" fn kmain() -> ! {
     vga::clear();
     let mut buf = [0u8; 10];
     vga::print(klib::utoa(42, &mut buf));
+    vga::print("\n");
+    vga::set_color(vga::Color::BrightGreen, vga::Color::Black);
+    vga::print("kfs-1\n");
+    vga::set_color(vga::Color::White, vga::Color::Black);
     loop { core::hint::spin_loop(); }
 }
 
@@ -214,8 +220,8 @@ Read against what you already know:
 
 `core::hint::spin_loop()` emits the x86 `pause` instruction — a hint that this
 loop is waiting on something, which saves power and avoids a pipeline penalty.
-The whole function — screen clear, print, idle loop — compiles to 52 bytes;
-[VGA.md](VGA.md) walks through the disassembly.
+The optimiser inlines the whole driver into `kmain`, which compiles to 804
+bytes ending in the `pause; jmp` idle pair the check finds `EIP` parked on.
 
 For contrast with `#[no_mangle]`: the panic handler *is* mangled, and appears in
 the symbol table at `0x100020` as
@@ -240,9 +246,9 @@ C-shaped pieces, so that is what `klib` holds:
 
 The punchline is what the optimiser did with that: `utoa(42)` is a pure
 function of a constant, so LLVM evaluated the whole digit loop at compile
-time. The linked binary is byte-for-byte identical to the previous commit's —
-same two immediate stores of `'4'` and `'2'` ([VGA.md](VGA.md)). The helper is
-real, exercised on the mandatory path, and free.
+time — at the commit introducing it, the linked binary came out byte-for-byte
+identical to the literal-string version. The helper is real, exercised on the
+mandatory path, and free.
 
 ### `kernel/src/vga.rs` — the screen driver
 
@@ -251,9 +257,12 @@ The screen is not a device you ask politely: it is 4 000 bytes of memory at
 module writes u16 cells (colour byte + ASCII byte) into it through
 `core::ptr::write_volatile` — `volatile` because these stores are never read
 back, and a store whose result is unused is exactly what an optimiser deletes.
-Two public functions, `clear()` and `print(&str)`, and the project's only
-`unsafe` blocks. The full story — the cell format, why `volatile`, what the
-optimiser did to the code — is [VGA.md](VGA.md).
+Three public entry points — `clear()`, `set_color(fg, bg)`, `print(&str)` —
+over a tracked write position: `\n`, wrapping at column 80, scrolling at the
+bottom row, and the blinking hardware cursor re-parked after each print
+through the CRT controller's I/O ports (the kernel's only inline `asm!`).
+The full story — the cell format, why `volatile`, the port I/O — is
+[VGA.md](VGA.md).
 
 ### `linker.ld` — where the code lands in RAM
 
@@ -290,15 +299,14 @@ The result:
 | Section | Address | Size | Notes |
 |---|---|---|---|
 | `.multiboot` | `0x100000` | 12 B | magic, flags, checksum |
-| `.text` | `0x100010` | 84 B | `_start`, the panic handler, `kmain` with the inlined VGA code |
-| `.bss` | `0x100070` | 16 KiB | the stack; never stored on disk |
+| `.text` | `0x100010` | 836 B | `_start`, the panic handler, `kmain` with the whole driver inlined |
+| `.rodata` | `0x100354` | 6 B | one string: `"kfs-1\n"` — the "42" is computed, never stored |
+| `.bss` | `0x100370` | 16 KiB + 8 B | the stack, then the driver's cursor and colour; never stored on disk |
 
-`.rodata` and `.data` are empty and get dropped — even the string `"42"`
-never lands there, because the optimiser folded it into immediate stores
-([VGA.md](VGA.md)). The ELF ends up with a single loadable chunk: 100 bytes on
-disk expanding to 16 496 bytes in RAM, the difference being the `.bss` the
-loader must provide but never reads from the file. `build/kernel.bin` is
-1 060 bytes total; the rest is ELF bookkeeping.
+`.data` is empty and gets dropped. The ELF ends up with a single loadable
+chunk: 872 bytes on disk expanding to 17 272 bytes in RAM, the difference
+being the `.bss` the loader must provide but never reads from the file.
+`build/kernel.bin` is 2 096 bytes total; the rest is ELF bookkeeping.
 
 The link command:
 
@@ -391,12 +399,12 @@ control. The path is inside the ISO, not on your machine — `make` stages
 
 ```
 boot/boot.asm ──nasm -f elf32──────────────► build/boot.o        (928 B)
-kernel/src/*  ──cargo build --release──────► libkernel.a         (748 KB)
-both          ──ld -m elf_i386 -n -T ...───► build/kernel.bin    (1 060 B)
-kernel.bin    ──grub-mkrescue──────────────► kfs.iso             (5 083 136 B)
+kernel/src/*  ──cargo build --release──────► libkernel.a         (750 KB)
+both          ──ld -m elf_i386 -n -T ...───► build/kernel.bin    (2 096 B)
+kernel.bin    ──grub-mkrescue──────────────► kfs.iso             (5 085 184 B)
 ```
 
-A 1 KB kernel produces a 5 MB image because `grub-mkrescue` copies GRUB itself
+A 2 KB kernel produces a 5 MB image because `grub-mkrescue` copies GRUB itself
 and its entire module tree — 294 files in this build — onto the ISO.
 
 Worth knowing:
@@ -419,19 +427,23 @@ Worth knowing:
 
 ## 5. What the screen shows
 
-Boot the ISO and you get a black screen with a white "42" in the top-left
-corner and a blinking cursor at row 2, column 0. Each part has a cause:
+Boot the ISO and you get a black screen with a white "42" on the first row, a
+bright-green "kfs-1" on the second, and a blinking cursor at row 2, column 0.
+Each part has a cause:
 
 1. **The black screen** is `vga::clear()`: 2 000 cells overwritten with a
    white-on-black space, erasing the grey text GRUB printed while loading.
    Before this existed, GRUB's leftovers stayed lit forever — nothing else
    ever wrote to the buffer.
-2. **The "42"** is `vga::print("42")`: two white-on-black cells at `0xb8000`
-   and `0xb8002`, the top-left of the grid.
-3. **The cursor** is hardware state, not a character: GRUB parked it at row 2
-   and the kernel never programs the VGA cursor registers (I/O ports `0x3D4`/
-   `0x3D5` — bonus work, [VGA.md](VGA.md)). It blinks with the attribute of
-   the cell it sits on, which `clear()` painted white-on-black.
+2. **The "42"** is `kmain` printing `klib::utoa(42, ...)`: two white-on-black
+   cells at `0xb8000` and `0xb8002`, the top-left of the grid. **The
+   "kfs-1"** is the same path after `set_color(BrightGreen, Black)`.
+3. **The cursor** is hardware state, not a character: it lives in CRT
+   controller registers reached through I/O ports `0x3D4`/`0x3D5`, and the
+   driver re-parks it after each print — row 2, column 0 is exactly where the
+   output ends. It blinks with the attribute of the cell it sits on, which
+   `clear()` painted white-on-black. (Before the driver programmed it, it
+   just blinked wherever GRUB abandoned it.)
 
 Real failures look different:
 
@@ -468,15 +480,15 @@ answer at all, the instruction pointer is inside the kernel's address range,
 and the kernel's writes really reached the VGA buffer.
 
 ```
-OK: kfs.iso is 5083136 bytes (limit 10485760)
-OK: guest alive, EIP=00100062 inside kernel
+OK: kfs.iso is 5085184 bytes (limit 10485760)
+OK: guest alive, EIP=00100352 inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
 
-`kmain` links at `0x100030` and its screen work ends at `0x10005e`, so
-`EIP=0x100062` is parked on the `jmp` of the idle loop that follows. GRUB
-accepted the header, `_start` set `esp`, Rust ran the VGA writes to
-completion, and the machine is not rebooting in a loop.
+`kmain` occupies `0x100030`-`0x100354` and ends in its idle loop, so
+`EIP=0x100352` is parked on that loop's `jmp`. GRUB accepted the header,
+`_start` set `esp`, Rust ran the VGA writes to completion, and the machine is
+not rebooting in a loop.
 
 `make re` is the other check that matters: a full `fclean` and rebuild proves
 the clean targets really remove everything and that the build works from

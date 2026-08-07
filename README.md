@@ -8,8 +8,8 @@ packaged as a bootable GRUB ISO.
 the thing `printf` and `malloc` are asking for help from. There is nothing
 underneath this one.
 
-How the screen works — and how two functions become 37 bytes of machine code —
-is in [docs/VGA.md](docs/VGA.md).
+How the screen works — colours, scrolling, and why the blinking cursor lives
+in I/O ports rather than memory — is in [docs/VGA.md](docs/VGA.md).
 
 **Never worked on a kernel before?** Start with
 [docs/](docs/): [ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how every piece
@@ -59,10 +59,10 @@ make re       # fclean + all
 
 ## Running it
 
-`make run` opens a qemu window showing a black screen with a white "42" in the
-top-left corner, plus a blinking cursor at row 2 — that cursor is hardware
-state GRUB left behind, and nothing moves it yet (see the bonus section of
-[docs/VGA.md](docs/VGA.md)).
+`make run` opens a qemu window showing a black screen with a white "42" on the
+first row, a bright-green "kfs-1" on the second, and the blinking hardware
+cursor parked right after — the driver moves it through I/O ports after every
+print ([docs/VGA.md](docs/VGA.md)).
 
 The eyeball test is not the proof, though — `make check` is. You cannot
 `assert` from inside a kernel — no test harness, no exit status, nowhere to
@@ -73,8 +73,8 @@ the qemu monitor for `info registers` until the kernel is reached (up to 60 s
 dump:
 
 ```
-OK: kfs.iso is 5083136 bytes (limit 10485760)
-OK: guest alive, EIP=00100062 inside kernel
+OK: kfs.iso is 5085184 bytes (limit 10485760)
+OK: guest alive, EIP=00100352 inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
 
@@ -82,7 +82,7 @@ Three facts have to hold: qemu is still alive to answer, the instruction
 pointer is at or above 1 MiB where the kernel was loaded, and the dumped frame
 shows white pixels (the "42" glyphs) with none of GRUB's grey `#a8a8a8`
 leftovers (so our clear really overwrote the screen). `kmain` links at
-`0x100030` (`nm build/kernel.bin`); `EIP=0x100062` is parked on the `jmp` of
+`0x100030` (`nm build/kernel.bin`); `EIP=0x100352` is parked on the `jmp` of
 its idle loop, after the screen writes. That means GRUB accepted our binary,
 `_start` set up a stack, and Rust ran to the end of `kmain`'s work. An
 unreachable monitor, or an `EIP` below 1 MiB, means the guest died.

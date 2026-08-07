@@ -56,8 +56,8 @@ instruction, because GRUB left the CPU there.
 the kernel to do something. Every `open`, `write` and `mmap` you have called was
 one. Not implemented here: there is no user space to knock on the door.
 
-**Driver** — kernel code that knows one specific device's private protocol. The
-planned VGA text output ([VGA.md](VGA.md)) will be this kernel's first driver.
+**Driver** — kernel code that knows one specific device's private protocol.
+The VGA text output ([VGA.md](VGA.md)) is this kernel's first driver.
 
 **Panic** — a bug the program has decided it cannot survive. In userland
 something catches it and kills your process; here nobody is listening, so a
@@ -129,8 +129,8 @@ there is no `catch` anywhere.
 faults a third time, gives up and resets. With no IDT this is what *any* CPU
 exception does to us, and from outside it looks like the machine rebooting in a
 loop. It is the kernel-land equivalent of a segfault, except nothing catches it.
-Here: `make check` rules it out by proving the guest is still in `kmain` after
-five seconds.
+Here: `make check` rules it out by proving the guest settles in `kmain` and
+stays there.
 
 **Paging / MMU** — the hardware that translates the addresses your code uses
 into real addresses in RAM, and so lets every process pretend it owns memory
@@ -158,8 +158,8 @@ to it changes hardware instead of storing a value. The VGA text screen at
 must not optimise away a write whose whole point is the side effect.
 
 **Port I/O** — x86's other way of reaching devices, using `in` and `out`
-instructions on a separate, small address space of its own. Needed later for the
-hardware cursor (ports `0x3D4`/`0x3D5`).
+instructions on a separate, small address space of its own. How the driver
+parks the hardware cursor (ports `0x3D4`/`0x3D5`).
 
 **VGA text mode** — the 80×25 grid of characters a PC starts up in. Each cell is
 two bytes at `0xb8000`: a character code and a colour attribute. Here: driven
@@ -188,7 +188,7 @@ which is why the multiboot magic `0x1BADB002` appears in the binary as
 through `ESP`. Nobody hands a kernel one; it reserves memory and points `ESP` at
 it. On x86 the stack grows *downwards*, so the initial pointer is the *highest*
 address of the reserved region. Here: 16 KiB in `.bss`, with `esp` starting at
-`stack_top` = `0x104070`.
+`stack_top` = `0x104370`.
 
 ---
 
@@ -304,7 +304,7 @@ to produce a 32-bit ELF object.
 **Mnemonic** — the human-readable name of an instruction: `mov`, `call`, `jmp`.
 
 **Opcode / machine code** — the actual bytes the CPU executes.
-`mov esp, 0x104070` is `bc 70 40 10 00`.
+`mov esp, 0x104370` is `bc 70 43 10 00`.
 
 **Label** — a name for an address (`_start:`, `stack_top:`). In NASM a label
 beginning with `.` belongs to the previous global label, which is why the hang
@@ -420,7 +420,7 @@ off.
 
 **Segment / program header** — the loader's view of an ELF: which byte ranges to
 copy to which addresses with which permissions. Our kernel has one `LOAD`
-segment, 100 bytes on disk expanding to 16 496 in RAM.
+segment, 872 bytes on disk expanding to 17 272 in RAM.
 
 **Static library / archive (`.a`)** — a bundle of object files in one file.
 `cargo` emits `libkernel.a` — a bag of parts rather than a finished program — so

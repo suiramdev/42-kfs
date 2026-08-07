@@ -1,9 +1,10 @@
 # Screen output
 
-The subject requires the kernel to display "42". It does: `kmain` clears the
-screen and prints "42" through `kernel/src/vga.rs` before settling into its
-idle loop. This file explains what "the screen" actually is on this machine,
-how the module drives it, and how the result is verified.
+The subject requires the kernel to display "42". It does — white on black, with
+a bright-green "kfs-1" underneath — and the driver behind it now covers the
+subject's first two bonuses: colours, a tracked cursor with line wrapping, and
+scrolling. This file explains what "the screen" actually is on this machine,
+how `kernel/src/vga.rs` drives it, and how the result is verified.
 
 ## What "the screen" actually is here
 
@@ -30,91 +31,103 @@ This is **memory-mapped I/O**: an address that is really a device. Writing to it
 changes hardware instead of storing a value. That distinction matters to the
 compiler — see `volatile` below.
 
-## The implementation
+## The driver
 
 `kernel/src/vga.rs`, declared with `mod vga;` in `kernel/src/lib.rs`.
 
-- **Access:** `0xb8000 as *mut u16`, every write through
-  `core::ptr::write_volatile`. `volatile` tells the compiler it may not delete,
-  merge or reorder these writes. Without it the optimiser is entitled to throw
-  away a store whose result is never read back — which is every store here,
-  because the *act* of writing is the whole point. Touching a raw pointer needs
-  `unsafe`; that keyword does not switch off any checks, it just moves the
-  burden of proof from the compiler to us. The one condition that makes the
-  pointer arithmetic sound — the cell index stays below 80x25 — is asserted in
-  the single helper every write funnels through.
-- **No allocation, no `core::fmt`.** There is no heap, and formatting machinery
-  is far more than "put two characters on screen" needs.
-- **API, first iteration:**
-  - `pub fn clear()` — fill all 80x25 cells with `0x0F20`, a white-on-black
-    space.
-  - `pub fn print(s: &str)` — for each byte `b` of `s`, write `0x0F00 | b as u16`
-    starting at cell 0, incrementing the index. Non-ASCII bytes go through
-    as-is and render as code page 437 glyphs. Output past cell 1999 is dropped;
-    no wrapping or scrolling exists yet.
-- **`kmain`:** `vga::clear()`, then print "42" — computed through
-  `klib::utoa(42, &mut buf)` rather than written as a literal, so the kernel
-  library's number formatting is exercised on the mandatory path. As the
-  disassembly below shows, the optimiser folds the difference away entirely.
+- **Access:** `0xb8000 as *mut u16`, every access through
+  `core::ptr::write_volatile` / `read_volatile`. `volatile` tells the compiler
+  it may not delete, merge or reorder these accesses. Without it the optimiser
+  is entitled to throw away a store whose result is never read back — which is
+  every store here, because the *act* of writing is the whole point. Touching a
+  raw pointer needs `unsafe`; that keyword does not switch off any checks, it
+  just moves the burden of proof from the compiler to us. The one condition
+  that makes the pointer arithmetic sound — the cell index stays below 80x25 —
+  is asserted in the two helpers every access funnels through.
+- **State:** two `static mut`s — the next cell to write and the current
+  colour. Plain mutable statics are a bug in most programs; here nothing is
+  concurrent (one CPU, interrupts never enabled, every call rooted in `kmain`'s
+  single call chain), and the module keeps them private behind accessor
+  functions.
+- **No allocation, no `core::fmt`.** There is no heap, and the formatting
+  machinery waits for the `printk` bonus.
+- **API:**
+  - `pub fn clear()` — fill all 80x25 cells with a space in the current
+    colour, cursor back to the top-left.
+  - `pub fn set_color(fg: Color, bg: Color)` — colour for everything printed
+    from now on. `Color` is the 16-entry VGA palette as a `#[repr(u8)]` enum;
+    the attribute byte is `bg << 4 | fg`.
+  - `pub fn print(s: &str)` — write at the cursor: `\n` starts a new line,
+    other bytes are written as-is (non-ASCII renders as code page 437 glyphs)
+    and wrap at column 80. Output past the bottom row scrolls everything up
+    one line: rows 1-24 are copied over rows 0-23 — whole u16s, so each
+    character keeps its colour — and the bottom row is blanked.
+- **`kmain`:** clear, print "42" — computed through `klib::utoa(42, &mut buf)`
+  rather than written as a literal, so the kernel library is exercised on the
+  mandatory path — then "kfs-1" in bright green.
 
-### What the compiler made of it
+## The hardware cursor
 
-The whole module optimises down to 37 bytes of code inside `kmain` (52 with
-its idle loop and alignment padding):
+The blinking underscore is not a character in the buffer: it is the CRT
+controller marking a cell index it holds in two registers. Those registers live
+in x86's *other* address space — **port I/O** — reached with the `in`/`out`
+instructions rather than loads and stores. Write a register index to port
+`0x3D4`, then the value to `0x3D5`; registers `0x0E`/`0x0F` are the cursor
+position's high and low byte.
 
-```
-00100030 <kmain>:
-  100030: b8 60 f0 ff ff    mov  $0xfffff060,%eax
-  ...
-  100040: 66 c7 80 a0 8f 0b 00 20 0f   movw $0xf20,0xb8fa0(%eax)
-  100049: 83 c0 02                     add  $0x2,%eax
-  10004c: 75 f2                        jne  100040
-  10004e: 66 c7 05 00 80 0b 00 34 0f   movw $0xf34,0xb8000
-  100057: 66 c7 05 02 80 0b 00 32 0f   movw $0xf32,0xb8002
-  100060: f3 90                        pause
-  100062: eb fc                        jmp  100060
-```
+`print` and `clear` re-park the cursor after their last write, through a
+two-instruction `outb` wrapper around inline `asm!` — the kernel's first and
+so far only assembly outside `boot/boot.asm`. Before this, the cursor blinked
+wherever GRUB abandoned it; now it tracks the end of our output, which is what
+makes the screen read like a terminal.
 
-`clear()` became a counted loop storing `0x0F20` (white-on-black space) into
-all 2 000 cells — the negative starting index is just the optimiser's way of
-making the loop end when `eax` hits zero. The print was unrolled completely:
-two immediate stores of `0x0F34` and `0x0F32` straight into `0xb8000` and
-`0xb8002`. Not only did the string never reach `.rodata` (the section stayed
-empty) — the text is not even a string in the source. `kmain` calls
-`klib::utoa(42, ...)`, and LLVM evaluated the whole digit-extraction loop at
-compile time, down to the same two stores a literal `"42"` produced. And the
-`volatile` contract held: every store is present, in order, none merged — the
-optimiser reshaped everything *around* the writes, never the writes.
+## Proven behaviour
+
+Booted and frame-dumped (the scroll/wrap proof ran a throwaway `kmain` that
+printed 33 lines and a 200-character line):
+
+- 30 numbered lines on a 25-row screen leave lines 9-30 on screen: the top
+  scrolled away, the bottom kept.
+- A 200-character line folds at column 80 across three rows.
+- The cursor sits exactly after the last character printed.
+- Colours travel with their cells when the screen scrolls.
 
 ## Later, for the bonus part
 
-A colour parameter on `print`; cursor tracking and scrolling (shift rows up with
-a `copy` once output passes row 24); moving the blinking hardware cursor through
-I/O ports `0x3D4` and `0x3D5`; and a `printk`-style formatter implementing
-`core::fmt::Write`, so `write!` works.
+A `printk`-style formatter implementing `core::fmt::Write`, so `write!` works
+(numbers currently go through `klib::utoa` by hand); keyboard input; multiple
+virtual screens.
 
 ## How it is verified
 
-`make check` gained a screen assertion next to the `EIP` one — same principle,
+`make check` has a screen assertion next to the `EIP` one — same principle,
 ask the emulator from outside, because the kernel has no way to report on
 itself. The QEMU monitor dumps the guest's framebuffer with
-`screendump build/screen.ppm`, and the check requires two things of that frame:
+`screendump build/screen.ppm` (re-dumping for a few seconds if the frame is
+stale — qemu repaints its display surface on its own timer), and the check
+requires two things of the final frame:
 
 1. **Some pure-white pixels exist** — the "42" glyphs, drawn with attribute
    `0x0F`, render `#ffffff`.
 2. **No `#a8a8a8` pixels remain** — that grey is the colour of GRUB's leftover
    boot text, so its absence proves `clear()` really overwrote the buffer.
 
-After `clear()` the frame contains only black and white, so grepping the raw
-P6 byte stream for the two colour triples cannot false-positive across pixel
-boundaries. A successful run prints:
+The greps scan the raw P6 byte stream, which is sound only while the kernel
+draws nothing that could counterfeit either triple. That is why the boot
+screen sticks to white, black and the *bright* half of the palette (the green
+of "kfs-1" renders `#54fc54`): the dim half — green `#00a800`, red `#a80000`,
+cyan `#00a8a8`... — contains `a8` bytes that adjacent pixels could reassemble
+into GRUB-grey, and light grey (colour 7) *is* `#a8a8a8`. The constraint is
+restated in the Makefile next to the check.
+
+A successful run prints:
 
 ```
-OK: guest alive, EIP=00100062 inside kernel
+OK: guest alive, EIP=00100352 inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
 
-The other white thing in the frame is the hardware cursor, still blinking at
-row 2 where GRUB parked it — nothing moves it yet (that is the bonus's I/O
-port work). It blinks in the attribute of the cell it sits on, which `clear()`
-set to white-on-black, so it does not disturb either assertion.
+The other white thing in the frame is the hardware cursor — blinking at row 2,
+column 0 because the kernel parked it there after printing its two lines. It
+blinks in the attribute of the cell it sits on (white-on-black after
+`clear()`), so it disturbs neither assertion.
