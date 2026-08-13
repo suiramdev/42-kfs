@@ -9,6 +9,11 @@ LDFLAGS        = -m elf_i386 -n -T linker.ld
 # Fedora ships grub2-*, Debian ships grub-*.
 GRUB_MKRESCUE ?= $(shell command -v grub-mkrescue || command -v grub2-mkrescue)
 GRUB_FILE     ?= $(shell command -v grub-file || command -v grub2-file)
+# grub-mkrescue copies whatever GRUB's data directory holds into the image.
+# On Fedora that is a 2.4 MiB Unicode font plus ~6 MiB of translations, which
+# alone push the ISO past MAX_ISO_SIZE. A single English menuentry uses none of
+# them, so ask for none: the empty lists are what disable each set.
+GRUBFLAGS      = --fonts= --locales= --themes=
 QEMU          ?= qemu-system-i386
 CARGO         ?= cargo
 
@@ -38,7 +43,7 @@ $(NAME): $(KERNEL_BIN) grub.cfg
 	mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL_BIN) $(ISODIR)/boot/kernel.bin
 	cp grub.cfg $(ISODIR)/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $@ $(ISODIR)
+	$(GRUB_MKRESCUE) $(GRUBFLAGS) -o $@ $(ISODIR)
 	@size=$$(stat -c %s $@ 2>/dev/null || stat -f %z $@); \
 	test $$size -le $(MAX_ISO_SIZE) \
 		|| { echo "FAIL: $@ is $$size bytes, over $(MAX_ISO_SIZE)"; exit 1; }; \

@@ -1,5 +1,7 @@
 target/
 build/
-*.iso
 *.o
 .codegraph/
+
+# kfs.iso is deliberately tracked: chapter VI asks for "a basic virtual image"
+# in the repository, and only what is in the repository is graded.

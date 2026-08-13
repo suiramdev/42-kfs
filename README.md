@@ -58,6 +58,37 @@ make fclean   # clean + remove kfs.iso
 make re       # fclean + all
 ```
 
+The image is built without GRUB's fonts, locales and themes (`--fonts=
+--locales= --themes=`, `GRUBFLAGS` in the Makefile). Fedora's
+`grub2-tools-extra` ships a 2.4 MiB Unicode font and ~6 MiB of translations
+that `grub-mkrescue` copies in by default — enough on their own to push the ISO
+past the 10 MB limit. A single English menuentry uses none of them.
+
+## Build without root (school machines)
+
+`grub-mkrescue` needs the BIOS boot modules — `grub2-pc-modules` on Fedora,
+`grub-pc-bin` on Debian — to put a boot sector on the ISO. Miss them and it
+still writes an ISO without complaining: a ~380 KB one, with no boot sector.
+The guest then never leaves the BIOS, and `make check` fails with an `EIP`
+around `0x0000b78c` (real-mode SeaBIOS) instead of an address inside the
+kernel.
+
+Where you cannot install packages, build inside a container you own:
+
+```sh
+toolbox create -y
+toolbox run sudo dnf install -y nasm binutils gcc glibc-devel \
+    grub2-tools grub2-tools-extra grub2-pc-modules xorriso mtools \
+    qemu-system-x86 socat
+toolbox enter          # then make / make run / make check as usual
+```
+
+`$HOME` is shared with the container, so the host's nightly Rust toolchain is
+used as-is — no second `rustup` install. One catch: `toolbox enter` starts a
+*login* shell, which reads `~/.bash_profile` and not `~/.bashrc`. If
+`~/.cargo/bin` is only on `PATH` in the latter, the build stops at `cargo:
+command not found`; source one from the other.
+
 ## Running it
 
 `make run` opens a qemu window showing a black screen with a white "42" on the
@@ -76,7 +107,7 @@ the qemu monitor for `info registers` until the kernel is reached (up to 60 s
 dump:
 
 ```
-OK: kfs.iso is 5085184 bytes (limit 10485760)
+OK: kfs.iso is 3663872 bytes (limit 10485760)
 OK: guest alive, EIP=001002fa inside kernel
 OK: screen cleared and "42" glyphs lit
 ```
