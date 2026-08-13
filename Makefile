@@ -2,22 +2,6 @@ NAME          := kfs.iso
 BUILD         := build
 ISODIR        := $(BUILD)/iso
 
-# Subject III.2.2 lists its six flags as "a C++ example" and says to adapt them.
-# Rust enforces four of the six structurally rather than per-invocation, so the
-# map from the subject's list to this build is:
-#
-#   -fno-exception      -C panic=abort, below (no unwinder is ever linked)
-#   -fno-stack-protector -Z stack-protector=none, below (also the rustc default)
-#   -fno-rtti           n/a: Rust has no RTTI to emit
-#   -fno-builtin        n/a: rustc calls no libc; the mem* intrinsics come from
-#                       compiler_builtins, rebuilt from source by build-std
-#                       (kernel/.cargo/config.toml), never from the host
-#   -nostdlib           #![no_std] + "os": "none" (kernel/i686-kfs.json), and
-#   -nodefaultlibs      -nostdlib on the link line below
-#
-# The check that actually matters is behavioural, not textual: `nm -u` on
-# kernel.bin must print nothing. A single undefined symbol means something
-# expects a host library at load time, and GRUB will not supply one.
 NASM          ?= nasm
 NASMFLAGS      = -f elf32
 LD            ?= ld

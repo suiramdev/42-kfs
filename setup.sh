@@ -1,16 +1,8 @@
 #!/bin/sh
-# Put a Fedora machine in a state where `make check` passes, without ever
-# asking for root — the case on a school machine, or on a peer's during
-# defense.
-#
-# What it takes care of, in order:
-#   1. the build tools, installed inside a toolbox container when the host
-#      lacks them (a toolbox is a Fedora you own, so `sudo` works in it);
-#   2. rustup, which installs into $HOME and needs no root either. The
-#      nightly toolchain and rust-src come from rust-toolchain.toml, which
-#      cargo applies on its own the first time it runs.
-#
-# Idempotent: run it twice, the second run installs nothing.
+# Put a Fedora machine in a state where `make check` passes, without ever asking
+# for root — the case at school, or on a peer's machine during defense. Missing
+# build tools go into a toolbox container (a Fedora you own, so `sudo` works in
+# it); rustup installs into $HOME. Idempotent: the second run installs nothing.
 
 set -eu
 
@@ -67,11 +59,9 @@ if [ -x "$CARGO_DIR/bin/cargo" ]; then
 else
 	say "Rust: installing rustup (no root involved)."
 	# Toolchain, rust-src and the crate registry come to ~1.6 GB (measured),
-	# landing on a home partition that is 4.7 GB in total at school. Say so
-	# before filling it rather than after — measured on the partition that
-	# will actually receive it, which RUSTUP_HOME may have moved elsewhere.
-	# A toolbox shares $HOME and nothing else of the host's disks — a
-	# RUSTUP_HOME pointing anywhere else simply would not exist in there.
+	# onto a home partition that is 4.7 GB in total at school — so check
+	# before filling it, on the partition RUSTUP_HOME actually points at. A
+	# toolbox shares $HOME and nothing else, so a path outside it cannot exist.
 	case "$RUSTUP_DIR/" in
 	"$HOME"/*) ;;
 	*)
