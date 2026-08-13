@@ -2,10 +2,27 @@ NAME          := kfs.iso
 BUILD         := build
 ISODIR        := $(BUILD)/iso
 
+# Subject III.2.2 lists its six flags as "a C++ example" and says to adapt them.
+# Rust enforces four of the six structurally rather than per-invocation, so the
+# map from the subject's list to this build is:
+#
+#   -fno-exception      -C panic=abort, below (no unwinder is ever linked)
+#   -fno-stack-protector -Z stack-protector=none, below (also the rustc default)
+#   -fno-rtti           n/a: Rust has no RTTI to emit
+#   -fno-builtin        n/a: rustc calls no libc; the mem* intrinsics come from
+#                       compiler_builtins, rebuilt from source by build-std
+#                       (kernel/.cargo/config.toml), never from the host
+#   -nostdlib           #![no_std] + "os": "none" (kernel/i686-kfs.json), and
+#   -nodefaultlibs      -nostdlib on the link line below
+#
+# The check that actually matters is behavioural, not textual: `nm -u` on
+# kernel.bin must print nothing. A single undefined symbol means something
+# expects a host library at load time, and GRUB will not supply one.
 NASM          ?= nasm
 NASMFLAGS      = -f elf32
 LD            ?= ld
-LDFLAGS        = -m elf_i386 -n -T linker.ld
+LDFLAGS        = -m elf_i386 -n -nostdlib -T linker.ld
+RUSTFLAGS     ?= -C panic=abort -C no-redzone=y -Z stack-protector=none
 # Fedora ships grub2-*, Debian ships grub-*.
 GRUB_MKRESCUE ?= $(shell command -v grub-mkrescue || command -v grub2-mkrescue)
 GRUB_FILE     ?= $(shell command -v grub-file || command -v grub2-file)
@@ -19,6 +36,7 @@ QEMU          ?= qemu-system-i386
 # which a login shell or a bare `make` may never have read. Fall back to the
 # known install path rather than fail with "cargo: command not found".
 CARGO         ?= $(shell command -v cargo || echo $(or $(CARGO_HOME),$(HOME)/.cargo)/bin/cargo)
+NM            ?= nm
 
 KERNEL_LIB    := kernel/target/i686-kfs/release/libkernel.a
 KERNEL_BIN    := $(BUILD)/kernel.bin
@@ -36,11 +54,17 @@ $(BUILD)/boot.o: boot/boot.asm | $(BUILD)
 
 # Phony: cargo does its own change detection.
 cargo:
-	cd kernel && $(CARGO) build --release
+	cd kernel && RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) build --release
 
 $(KERNEL_BIN): $(BUILD)/boot.o linker.ld cargo
 	$(LD) $(LDFLAGS) -o $@ $(BUILD)/boot.o $(KERNEL_LIB)
 	$(GRUB_FILE) --is-x86-multiboot $@
+# -nostdlib is a promise about the *result*, so check the result: an undefined
+# symbol here is a host library the kernel expects and GRUB cannot provide.
+	@if $(NM) -u $@ | grep -q .; then \
+		echo "FAIL: $@ needs host libraries:"; $(NM) -u $@; exit 1; \
+	fi
+	@echo "OK: $@ is freestanding (no undefined symbols)"
 
 $(NAME): $(KERNEL_BIN) grub.cfg
 	mkdir -p $(ISODIR)/boot/grub
