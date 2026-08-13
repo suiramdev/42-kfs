@@ -15,7 +15,10 @@ GRUB_FILE     ?= $(shell command -v grub-file || command -v grub2-file)
 # them, so ask for none: the empty lists are what disable each set.
 GRUBFLAGS      = --fonts= --locales= --themes=
 QEMU          ?= qemu-system-i386
-CARGO         ?= cargo
+# rustup installs into $HOME but only puts itself on PATH from a shell rc file,
+# which a login shell or a bare `make` may never have read. Fall back to the
+# known install path rather than fail with "cargo: command not found".
+CARGO         ?= $(shell command -v cargo || echo $(or $(CARGO_HOME),$(HOME)/.cargo)/bin/cargo)
 
 KERNEL_LIB    := kernel/target/i686-kfs/release/libkernel.a
 KERNEL_BIN    := $(BUILD)/kernel.bin

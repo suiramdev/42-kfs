@@ -64,30 +64,40 @@ The image is built without GRUB's fonts, locales and themes (`--fonts=
 that `grub-mkrescue` copies in by default — enough on their own to push the ISO
 past the 10 MB limit. A single English menuentry uses none of them.
 
-## Build without root (school machines)
-
-`grub-mkrescue` needs the BIOS boot modules — `grub2-pc-modules` on Fedora,
-`grub-pc-bin` on Debian — to put a boot sector on the ISO. Miss them and it
-still writes an ISO without complaining: a ~380 KB one, with no boot sector.
-The guest then never leaves the BIOS, and `make check` fails with an `EIP`
-around `0x0000b78c` (real-mode SeaBIOS) instead of an address inside the
-kernel.
-
-Where you cannot install packages, build inside a container you own:
+## Build on a machine that has none of this (school machines)
 
 ```sh
-toolbox create -y
-toolbox run sudo dnf install -y nasm binutils gcc glibc-devel \
-    grub2-tools grub2-tools-extra grub2-pc-modules xorriso mtools \
-    qemu-system-x86 socat
-toolbox enter          # then make / make run / make check as usual
+./setup.sh
 ```
 
-`$HOME` is shared with the container, so the host's nightly Rust toolchain is
-used as-is — no second `rustup` install. One catch: `toolbox enter` starts a
-*login* shell, which reads `~/.bash_profile` and not `~/.bashrc`. If
-`~/.cargo/bin` is only on `PATH` in the latter, the build stops at `cargo:
-command not found`; source one from the other.
+That is the whole procedure on a freshly cloned repo — including a school
+machine where you have no root, which is what the script is for. It installs
+the build tools, installs Rust, then runs `make check` so you see the proof
+rather than take its word. Run it twice and the second run installs nothing.
+
+What it works around:
+
+*No root.* `toolbox` gives you a Fedora container you own, so `sudo` inside it
+needs no password. The script creates one only if the host is missing tools
+(~500 MB the first time). Afterwards, build with `toolbox enter` then `make`.
+
+*No Rust.* `rustup` installs into `$HOME`, no root either; `rust-toolchain.toml`
+pins the nightly and `rust-src` the build needs. Budget ~1.6 GB — enough to
+matter on the 4.7 GB home partition of a school machine, so the script measures
+the free space and refuses early rather than dying half-installed. `RUSTUP_HOME`
+and `CARGO_HOME` can move it, but only to a path under `$HOME`: a toolbox
+shares that and no other disk (`/goinfre` is invisible from inside).
+
+*No `PATH` entry for cargo.* `rustup` only edits shell rc files, which a login
+shell or a bare `make` may never read; the Makefile falls back to
+`$CARGO_HOME/bin/cargo` on its own.
+
+The failure the script exists to prevent is a quiet one. Without the BIOS boot
+modules — `grub2-pc-modules` on Fedora, `grub-pc-bin` on Debian —
+`grub-mkrescue` still writes an ISO and says nothing: a ~380 KB one with no
+boot sector, on which the guest never leaves the BIOS. `make check` catches it
+(`EIP=0x0000b78c`, real-mode SeaBIOS, outside the kernel), which is exactly why
+the script ends by running it.
 
 ## Running it
 
