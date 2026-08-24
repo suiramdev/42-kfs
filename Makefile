@@ -5,7 +5,13 @@ ISODIR        := $(BUILD)/iso
 NASM          ?= nasm
 NASMFLAGS      = -f elf32
 LD            ?= ld
-LDFLAGS        = -m elf_i386 -n -nostdlib -T linker.ld
+# --gc-sections drops every section nothing reaches from `_start`. rustc builds
+# compiler_builtins as one 318 KiB object file, so needing a single helper from
+# it makes `ld` pull the whole member in, soft-float f128 maths included.
+# Measured: kernel.bin was 150112 bytes and held 61 float symbols; it is now
+# 17828 bytes and holds none. `linker.ld` KEEPs the multiboot header, which
+# nothing references and would otherwise be collected.
+LDFLAGS        = -m elf_i386 -n -nostdlib --gc-sections -T linker.ld
 RUSTFLAGS     ?= -C panic=abort -C no-redzone=y -Z stack-protector=none
 # Fedora ships grub2-*, Debian ships grub-*.
 GRUB_MKRESCUE ?= $(shell command -v grub-mkrescue || command -v grub2-mkrescue)
