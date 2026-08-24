@@ -13,10 +13,14 @@ align 4
     dd FLAGS
     dd CHECKSUM
 
+; The kernel stack. Exported so `kernel::stack` can print it: the dump
+; needs the real bounds, and only the linker knows where .bss landed.
 section .bss
 align 16
+global stack_bottom
 stack_bottom:
     resb 16384
+global stack_top
 stack_top:
 
 section .text

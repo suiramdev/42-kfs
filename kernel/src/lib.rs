@@ -2,37 +2,39 @@
 
 use core::panic::PanicInfo;
 
+mod gdt;
 mod keyboard;
 mod klib;
 mod port;
 mod printk;
+mod shell;
+mod stack;
 mod vga;
 
 use printk::printk;
 
 /// Kernel entry point, called from `_start` in `boot/boot.asm`.
 ///
-/// After the banner, `kmain` becomes a dumb terminal: poll the
-/// keyboard, echo what it says. Busy-polling is the honest option
-/// today — waking on a key press instead takes interrupts, which is
-/// the next KFS project.
+/// The first act is to replace GRUB's segmentation with our own. Every
+/// segment register still holds a hidden copy of GRUB's descriptor, so
+/// the machine keeps working until something reloads one, and the
+/// multiboot specification is explicit that reloading before the kernel
+/// owns a table is not allowed. `gdt::install` earns that right.
+///
+/// Then the banner, then the shell, which never returns. Everything is
+/// polled: waking on a key press instead takes interrupts, which is the
+/// next KFS project.
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
+    unsafe { gdt::install() };
     vga::clear();
     let mut buf = [0u8; 10];
     vga::print(klib::utoa(42, &mut buf));
     vga::print("\n");
     vga::set_color(vga::Color::BrightGreen, vga::Color::Black);
-    printk!("kfs-{}\n", 1);
+    printk!("kfs-{}\n", 2);
     vga::set_color(vga::Color::White, vga::Color::Black);
-    loop {
-        match keyboard::poll() {
-            Some(keyboard::Key::Char(b)) => vga::put_char(b),
-            Some(keyboard::Key::Backspace) => vga::backspace(),
-            Some(keyboard::Key::Screen(n)) => vga::switch_screen(n),
-            None => core::hint::spin_loop(),
-        }
-    }
+    shell::run()
 }
 
 /// Panics land here — and now show up on screen instead of silently
