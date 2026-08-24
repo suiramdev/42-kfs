@@ -50,7 +50,11 @@ there is no sandbox to be inside.
 
 **Ring 0** — x86's name for its most privileged level, the one a kernel runs in;
 ordinary applications get ring 3. Our code is in ring 0 from its very first
-instruction, because GRUB left the CPU there.
+instruction, because GRUB left the CPU there. A ring lives in two bits of a
+segment descriptor's access byte, and in the low two bits of a selector. kfs-2
+declares user code, data and stack descriptors at ring 3, so the table the
+subject asks for is complete, but nothing runs there yet: leaving ring 0 needs
+a way back in, and that means an interrupt table. Here: `kernel/src/gdt.rs`.
 
 **System call** — the single legal doorway a user-space program has for asking
 the kernel to do something. Every `open`, `write` and `mmap` you have called was
@@ -91,7 +95,9 @@ answers a debugger's most basic question, "which line am I on". Here: `make
 check` passes only when `EIP` is inside the kernel.
 
 **ESP** — the register holding the address of the top of the stack (see
-**Stack**). Here: `_start`'s first instruction loads it with `stack_top`.
+**Stack**), otherwise called the stack pointer. Here: `_start`'s first
+instruction loads it with `stack_top`. The `stack` command dumps memory upward
+from the live value, so the first address of a dump is the stack pointer itself.
 
 **EFLAGS** — the register holding one-bit facts about the CPU: was the last
 comparison equal, are interrupts enabled, did the last addition overflow.
@@ -110,7 +116,82 @@ code.
 **Segment / GDT** — x86 can slice memory into segments, each described by an
 entry in a table called the Global Descriptor Table. GRUB installs a flat,
 permissive GDT before handing over, so the kernel works without touching it;
-replacing it with our own is a later KFS step.
+kfs-2 replaces it with the kernel's own, seven descriptors copied to physical
+`0x800`. Here: `kernel/src/gdt.rs`, the subject of [GDT.md](GDT.md).
+
+**Segment descriptor** -- one 8-byte row of the descriptor table, and the thing
+the CPU actually reads. It carries a 32-bit base, a 20-bit limit, an access
+byte and four flag bits. The fields are scattered across the eight bytes for
+compatibility with the 80286, so building one is bit shuffling.
+
+**Access byte** -- byte 5 of a descriptor, which says what the segment is: bit
+7 present, bits 6-5 the ring, bit 4 code or data, bit 3 executable, bit 2
+direction or conforming, bit 1 readable or writable, bit 0 accessed. The six
+segments of this kernel differ in nothing else: `0x9a` and `0x92` at ring 0,
+`0xfa` and `0xf2` at ring 3.
+
+**Selector** -- the value a segment register holds: an index into the
+descriptor table, shifted left by 3, plus the ring it asks for in the low two
+bits. Here: `0x08` kernel code, `0x10` kernel data, `0x18` kernel stack, and
+`0x23`, `0x2b`, `0x33` for the ring 3 rows, whose low bits carry the 3.
+
+**Segment register** -- the six registers that hold those selectors: `cs` for
+instructions, `ss` for the stack, and `ds`, `es`, `fs`, `gs` for data. No `mov`
+can write `cs`, which is why a table install ends in a far return.
+
+**Descriptor cache** -- the hidden copy of a descriptor that each segment
+register keeps. The CPU reads the table when a selector is loaded and works
+from the copy afterwards. That is why GRUB's segments keep working after GRUB's
+table is gone, and why the multiboot specification forbids reloading a segment
+register before the kernel owns a table.
+
+**Flat memory model** -- one segment over the whole address space: base 0,
+limit 4 GiB, for every descriptor. Segmentation then adds nothing to an
+address, and a linear address is a physical address. Every segment here is
+flat, which is also what makes it safe to swap tables while running, since no
+address in flight changes meaning.
+
+**Granularity flag** -- the descriptor bit that multiplies the limit by 4096. A
+20-bit limit reaches 1 MiB on its own; with the flag set, `0xfffff` becomes the
+full 4 GiB. Here: the flags byte `0xcf` of all six segments.
+
+**Expand-down segment** -- a data segment with the direction bit set, which
+inverts the meaning of the limit: valid offsets start above it rather than
+below. Intended for a stack that grows downwards. A flat expand-down segment
+reaches no address at all, so this kernel has none, and `shell::seg_range`
+prints such a descriptor as an empty range instead of a healthy-looking limit.
+
+**Accessed bit** -- bit 0 of the access byte. The CPU sets it in the descriptor
+*in memory* the first time its selector is loaded, so the table you authored is
+not byte-for-byte the table you read back: an authored `0x92` returns `0x93`.
+`tools/check.sh` masks that one bit.
+
+**Null descriptor** -- entry 0 of the table, which must be eight zero bytes.
+The CPU refuses to load selector 0, and that is what turns an uninitialised
+segment register into a fault instead of a silent read through whatever entry 0
+happened to describe.
+
+**Table register (GDTR)** -- the 6-byte register that tells the CPU where its
+descriptor table is: a 16-bit limit, then a 32-bit base, unaligned. The limit
+is the last valid byte, so seven descriptors give `0x0037`, which the kernel
+computes once as `gdt::LIMIT`. QEMU's monitor prints the register as
+`GDT=base limit`.
+
+**`lgdt`** -- the instruction that loads the table register from a 6-byte
+operand in memory. On its own it changes nothing an executing instruction can
+observe, because every segment register still holds its cached descriptor. The
+reloads after it are what take effect.
+
+**`sgdt`** -- the instruction that stores the table register back to memory. It
+answers what the CPU is really using rather than what the source declares,
+which is why the shell's `gdt` command reads the table through it.
+
+**Far jump / far return** -- a jump or a return that loads `cs` as well as
+`eip`. Since no `mov` may write `cs`, a kernel that has just installed its own
+table pushes the code selector and a return address and runs `retf`, which pops
+both together. Skipping that does not fault at once: the cached descriptor keeps
+working, and the failure arrives later, at the first interrupt, far call or ring
+change.
 
 **Interrupt** — an event that makes the CPU drop what it is doing and jump to a
 handler: a key press, a timer tick, a division by zero. It is a callback the
@@ -119,7 +200,8 @@ at boot and stay disabled here, because we have installed no handlers.
 
 **IDT** — the Interrupt Descriptor Table, the array mapping interrupt numbers to
 handler addresses. Not implemented yet, so there is nothing for an interrupt to
-call.
+call. The shell exploits that: `reboot`'s fallback loads a table register with
+base 0 and limit 0, so no vector can be fetched at all.
 
 **Exception** — an interrupt the CPU raises about itself: invalid opcode, page
 fault, division by zero. Same idea as a hardware-level thrown error, except
@@ -129,8 +211,12 @@ there is no `catch` anywhere.
 faults a third time, gives up and resets. With no IDT this is what *any* CPU
 exception does to us, and from outside it looks like the machine rebooting in a
 loop. It is the kernel-land equivalent of a segfault, except nothing catches it.
-Here: `make check` rules it out by proving the guest settles in `kmain` and
-stays there.
+Here: `make check` rules it out by proving the guest settles inside the kernel
+and stays there. The shell's `reboot` command also causes one on purpose, as
+its fallback: it loads an interrupt table of length zero and runs `int3`, so
+the CPU cannot find the handler, cannot find the double-fault handler either,
+and the third fault stops the processor, which the chipset wires to a reset.
+Linux reboots the same way ([SHELL.md](SHELL.md)).
 
 **Paging / MMU** — the hardware that translates the addresses your code uses
 into real addresses in RAM, and so lets every process pretend it owns memory
@@ -160,11 +246,16 @@ must not optimise away a write whose whole point is the side effect.
 **Port I/O** — x86's other way of reaching devices, using `in` and `out`
 instructions on a separate, small address space of its own. Here: the hardware
 cursor (ports `0x3D4`/`0x3D5`) and the PS/2 keyboard (status `0x64`, data
-`0x60`).
+`0x60`), and the reset command the shell writes to `0x64`. The two instructions
+live in one module, `kernel/src/port.rs`, which the screen, the keyboard and
+the shell all call.
 
 **PS/2 / 8042** — the classic PC keyboard interface and the controller chip
 behind it. QEMU emulates one regardless of your real keyboard. It hands out
-scancodes, never characters.
+scancodes, never characters. The same chip drives the CPU reset line, so a
+write of `0xfe` to port `0x64` restarts the machine, which is what the shell's
+`reboot` command does. QEMU's monitor can put a key straight into the chip's
+queue with `sendkey`.
 
 **Scancode** — the number a keyboard sends for a physical key *position*:
 press and release are separate codes (release = press | 0x80), and "which
@@ -173,7 +264,8 @@ Here: `kernel/src/keyboard.rs`, US QWERTY, set 1.
 
 **Polling** — asking a device "anything new?" in a loop, as opposed to the
 device raising an interrupt when something happens. Wasteful but simple, and
-the only option before an IDT exists. Here: `kmain`'s keyboard loop.
+the only option before an IDT exists. Here: the shell's line editor, which asks
+the keyboard for a key on every lap and pauses when there is none.
 
 **VGA text mode** — the 80×25 grid of characters a PC starts up in. Each cell is
 two bytes at `0xb8000`: a character code and a colour attribute. Here: driven
@@ -184,15 +276,19 @@ or characters out of. Change the memory and the screen changes.
 
 **`hlt`** — the instruction that stops the CPU until the next interrupt arrives.
 The correct way for a kernel to idle: a bare `while (true) {}` would burn a core
-for nothing. Here: the hang loop after `call kmain` in `_start`.
+for nothing. Here: the hang loop after `call kmain` in `_start`, and the
+shell's `halt` command, which runs `cli` and then `hlt` in a loop, because one
+`hlt` on its own can be resumed by the next interrupt.
 
 **`cli`** — "clear interrupt flag": tells the CPU to stop accepting maskable
-interrupts. Here: immediately before `hlt` in `_start`. Non-maskable events can
-still wake the CPU, which is why the `jmp` after it halts again.
+interrupts. Here: immediately before `hlt` in `_start`, and in the shell's
+`halt` command. Non-maskable events can still wake the CPU, which is why the
+`jmp` after it halts again.
 
 **`pause`** — an instruction meaning "this loop is only waiting", letting the
 CPU save power and avoid a pipeline penalty. Here: what
-`core::hint::spin_loop()` compiles to inside `kmain` (bytes `f3 90`).
+`core::hint::spin_loop()` compiles to inside the shell's key loop (bytes
+`f3 90`).
 
 **Little-endian** — x86 stores multi-byte values least-significant byte first,
 which is why the multiboot magic `0x1BADB002` appears in the binary as
@@ -202,7 +298,21 @@ which is why the multiboot magic `0x1BADB002` appears in the binary as
 through `ESP`. Nobody hands a kernel one; it reserves memory and points `ESP` at
 it. On x86 the stack grows *downwards*, so the initial pointer is the *highest*
 address of the reserved region. Here: 16 KiB in `.bss`, with `esp` starting at
-`stack_top` = `0x104690`.
+`stack_top` = `0x107710` and `stack_bottom` at `0x103710`. `boot.asm` exports
+both ends, so the shell's `stack` command can dump the part in use
+([STACK.md](STACK.md)).
+
+**Stack frame** -- the slice of the stack that belongs to one call: the return
+address the call pushed, saved registers, and that function's own locals. The
+newest frame is the lowest in memory, because x86 pushes downwards. A dump
+taken inside a function starts in that function's own frame, which is why the
+first four bytes of a `stack` dump are the return address into its caller.
+
+**Hex dump** -- the classic way to read raw memory: an address, then the bytes
+as two-digit hex, then the printable ones as characters. Here: 16 bytes to a
+row and 77 columns per row ([STACK.md](STACK.md)). The bytes come out in memory
+order, so on a little-endian machine a saved address reads backwards, and
+`0x0010063c` appears as `3c 06 10 00`.
 
 ---
 
@@ -242,13 +352,16 @@ this project uses. It reads a config file, loads a kernel image, prepares the CP
 
 **GRUB module** — a piece of GRUB itself that GRUB loads on demand: filesystem
 drivers, video drivers. `grub-mkrescue` copies its whole module tree onto the
-ISO — 294 files in this build — which is why a 1 KB kernel yields a 5 MB image.
+ISO, which is why a 17 KB kernel yields a 2.7 MB image. The Makefile passes
+`--fonts= --locales= --themes=` to leave GRUB's optional data out: on Fedora
+the font and the translations alone would push the image past the subject's
+limit.
 
 **`grub.cfg`** — GRUB's configuration file, read at boot from
 `/boot/grub/grub.cfg` inside the image. Here: the repo's `grub.cfg`, copied
 there by the Makefile.
 
-**`menuentry`** — one bootable choice in `grub.cfg`. Ours is named `"kfs-1"` and
+**`menuentry`** — one bootable choice in `grub.cfg`. Ours is named `"kfs"` and
 contains only `multiboot /boot/kernel.bin` and `boot`.
 
 **Multiboot specification** — a handshake between bootloaders and kernels: put a
@@ -256,7 +369,10 @@ recognisable header near the front of your image and any compliant bootloader
 will load it, handing you a machine already in protected mode plus a description
 of memory. It saves every hobby kernel from writing a bootloader. We use
 multiboot **1**; multiboot 2 is a different header format and a different GRUB
-command.
+command. The specification is also explicit about what it does *not*
+guarantee: the table register may be invalid on entry, so the kernel must not
+load any segment register, even with the same value, until it owns a descriptor
+table of its own.
 
 **Multiboot header** — the 12 bytes that do the identifying: magic, flags,
 checksum. GRUB scans the first 8 KiB of the binary for it, 4-byte aligned; find
@@ -318,7 +434,7 @@ to produce a 32-bit ELF object.
 **Mnemonic** — the human-readable name of an instruction: `mov`, `call`, `jmp`.
 
 **Opcode / machine code** — the actual bytes the CPU executes.
-`mov esp, 0x104690` is `bc 90 46 10 00`.
+`mov esp, 0x107710` is `bc 10 77 10 00`.
 
 **Label** — a name for an address (`_start:`, `stack_top:`). In NASM a label
 beginning with `.` belongs to the previous global label, which is why the hang
@@ -332,7 +448,8 @@ loop is `_start.hang`.
 - `resb` — reserve bytes without storing them in the file. Used for the stack.
 - `align` — pad until the address is a multiple of N.
 - `section` — start emitting into a named section.
-- `global` — export a symbol so the linker can see it (`_start`).
+- `global` — export a symbol so the linker can see it (`_start`,
+  `stack_bottom`, `stack_top`).
 - `extern` — declare a symbol defined elsewhere (`kmain`).
 
 **Calling convention** — the rules a caller and callee agree on: which registers
@@ -396,6 +513,10 @@ to put our code.
 - `.data` — writable data whose initial values sit in the file.
 - `.bss` — writable data that starts as zeros and occupies no file space.
 - `COMMON` — legacy uninitialised symbols, folded into `.bss` here.
+- `.got` -- the global offset table: one slot per symbol reached indirectly,
+  filled in by the linker.
+- `.eh_frame` -- unwind tables, which describe how to walk back out of a
+  panic. This kernel aborts instead, so `linker.ld` discards them.
 - `.comment` — toolchain version strings; not loaded.
 - `.note.GNU-stack` — a marker declaring whether the stack must be executable.
 - `.multiboot` — *our* custom section name, so the linker script can place the
@@ -414,7 +535,7 @@ with `nm`.
 
 **Relocation** — a hole in an object file with a note attached: "patch this
 address in once the final layout is known". `call kmain` in `boot.o` is one, and
-`ld` fills it with `0x100030`.
+`ld` fills it with `0x1022f0`.
 
 **Linker** — combines object files and libraries into one image, matching up
 symbols and assigning final addresses. Here: GNU `ld`, called with
@@ -428,13 +549,22 @@ does, so you write it out by hand. Here: `linker.ld`.
 currently handing out. `. = 1M;` moves it to `0x100000`, so the first section
 placed after that line starts there.
 
+**Section garbage collection** -- `ld --gc-sections` drops every input section
+nothing reaches from the entry point, and `KEEP(...)` in the linker script
+exempts one from the sweep. It matters more here than it looks: rustc emits
+`compiler_builtins` as a single object file, so needing one helper out of it
+pulls the whole 318 KiB member in, soft-float `f128` mathematics included.
+Measured: `kernel.bin` is 150 112 bytes without the flag and 17 828 bytes with
+it. The multiboot header is the one section that needs `KEEP`, because nothing
+in the program refers to it and GRUB finds it by scanning the file.
+
 **VMA / LMA** — a section's virtual address (where the code believes it is) and
 its load address (where it is actually put). Identical here, because paging is
 off.
 
 **Segment / program header** — the loader's view of an ELF: which byte ranges to
 copy to which addresses with which permissions. Our kernel has one `LOAD`
-segment, 1 680 bytes on disk expanding to 30 101 in RAM.
+segment, 14 088 bytes on disk expanding to 42 517 in RAM.
 
 **Static library / archive (`.a`)** — a bundle of object files in one file.
 `cargo` emits `libkernel.a` — a bag of parts rather than a finished program — so
@@ -443,9 +573,9 @@ and listed with `ar`.
 
 **Name mangling** — the compiler encoding module paths and types into a symbol's
 name so same-named functions cannot collide. This kernel's panic handler is
-mangled to `_RNvCschKVOpqoY1I_7___rustc17rust_begin_unwind` (visible whenever a
-panic site exists — see ARCHITECTURE on LTO). `#[no_mangle]` switches it off so
-assembly can refer to `kmain` by that exact name.
+mangled to `_RNvCs9aRK3BLRY2F_7___rustc17rust_begin_unwind`, and the shell makes
+a panic reachable, so it is in every kfs-2 build. `#[no_mangle]` switches it
+off so assembly can refer to `kmain` by that exact name.
 
 **`nm` / `objdump` / `readelf`** — the inspection tools: list symbols,
 disassemble and dump sections, print ELF headers. Every address quoted in
@@ -582,13 +712,34 @@ virtualisation means it can run x86 code on an arm64 Mac, slowly but faithfully.
 can see or touch. It reports CPU state, dumps the screen, pauses and resets the
 machine — a debugger attached to the emulated hardware rather than to a process.
 Exposed here on a unix socket with `-monitor unix:/tmp/kfs-mon,server,nowait`.
+Its text form is the **human monitor**, and `tools/check.sh` speaks it: all
+twenty assertions of `make check` are monitor round trips, and nothing inside
+the guest takes part in any of them.
 
 **`info registers`** — the monitor command printing the guest's CPU registers.
-The `EIP` it reports is the proof that the kernel is executing.
+The `EIP` it reports is the proof that the kernel is executing. It prints the
+six segment registers too, the table register as `GDT=base limit`, `ESP`, and
+the `HLT` flag, which is how the check proves the kernel's own descriptors are
+in use and that `halt` really stopped the processor.
+
+**`xp`** -- the monitor command that reads guest **physical** memory.
+`xp/14wx 0x800` prints the descriptor table as fourteen words, and
+`xp/2000hx 0xb8000` prints the whole VGA text buffer as 2 000 halfwords. The low
+byte of each cell is its character code, so decoding those bytes yields the
+exact text on screen.
+
+**`sendkey`** -- the monitor command that injects one key into the guest. It has
+no string form, so the check types a command one key per round trip. The key
+lands in the 8042 controller's queue, the status bit on port `0x64` goes high
+from queue occupancy alone, and the polled driver reads it with no interrupt
+involved.
 
 **`screendump file.ppm`** — the monitor command writing the current guest screen
-to an image. `make check` uses it to confirm the "42" glyphs are lit in white
-and that none of GRUB's grey leftover text survived the kernel's screen clear.
+to an image. kfs-1's check used it, and grepped the image for the white "42"
+glyphs and for the absence of GRUB's grey. kfs-2 reads the text out of the VGA
+buffer with `xp` instead, which compares characters rather than pixel colours,
+so the old constraint that kept dim palette colours off the boot screen is gone
+with it.
 
 **Headless** — running with no display attached.
 
