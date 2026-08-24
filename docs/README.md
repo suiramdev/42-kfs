@@ -14,7 +14,7 @@ assembly, a linker script, or a bootloader.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the whole thing works: power-on to the kernel's idle loop, every file's job, the memory map, and how the build is proven correct |
 | [GLOSSARY.md](GLOSSARY.md) | Every technical term used here, defined in plain language with comparisons to code you already know — kernel, GRUB, multiboot, linker script, `no_std`, and about a hundred more |
 | [VGA.md](VGA.md) | How characters get on screen: the VGA text buffer, the driver module, what the optimiser made of it, and how the check proves the "42" is lit |
-| `en.subject.pdf` | The original 42 assignment |
+| `kfs-1.subject.pdf` | The original 42 assignment |
 
 ## Where the project stands
 
