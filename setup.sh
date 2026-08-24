@@ -1,8 +1,4 @@
 #!/bin/sh
-# Put a Fedora machine in a state where `make check` passes, without ever asking
-# for root — the case at school, or on a peer's machine during defense. Missing
-# build tools go into a toolbox container (a Fedora you own, so `sudo` works in
-# it); rustup installs into $HOME. Idempotent: the second run installs nothing.
 
 set -eu
 
@@ -13,17 +9,12 @@ grub2-pc-modules xorriso mtools qemu-system-x86 socat"
 say() { printf '\n==> %s\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Every binary the Makefile shells out to, plus the BIOS boot modules
-# grub-mkrescue needs: without them it writes an ISO with no boot sector and
-# says nothing about it.
 host_has_tools() {
 	for t in nasm ld grub2-mkrescue grub2-file xorriso qemu-system-i386 socat; do
 		have "$t" || return 1
 	done
 	test -d /usr/lib/grub/i386-pc
 }
-
-# --- 1. build tools ---------------------------------------------------------
 
 if host_has_tools; then
 	say "Build tools: already on the host, no container needed."
@@ -36,20 +27,12 @@ else
 		echo "      listed at the top of this script by hand." >&2
 		exit 1
 	}
-	# `toolbox run true` fails when no container exists yet. Creating one
-	# pulls ~500 MB the first time, then costs nothing.
 	toolbox run true >/dev/null 2>&1 || toolbox create -y
-	# shellcheck disable=SC2086 # PKGS is a word list on purpose
+	# shellcheck disable=SC2086
 	toolbox run sudo dnf install -y $PKGS
 	RUN="toolbox run"
 fi
 
-# --- 2. rust ----------------------------------------------------------------
-
-# $HOME is shared with the container, so one install serves both sides.
-# `toolbox run` does NOT carry the environment into the container, so these
-# two are passed explicitly through `env` at every call below. Set them before
-# running this script to put the ~900 MB of rust somewhere other than $HOME.
 RUSTUP_DIR="${RUSTUP_HOME:-$HOME/.rustup}"
 CARGO_DIR="${CARGO_HOME:-$HOME/.cargo}"
 ENV="env RUSTUP_HOME=$RUSTUP_DIR CARGO_HOME=$CARGO_DIR"
@@ -58,10 +41,6 @@ if [ -x "$CARGO_DIR/bin/cargo" ]; then
 	say "Rust: already installed at $CARGO_DIR/bin/cargo."
 else
 	say "Rust: installing rustup (no root involved)."
-	# Toolchain, rust-src and the crate registry come to ~1.6 GB (measured),
-	# onto a home partition that is 4.7 GB in total at school — so check
-	# before filling it, on the partition RUSTUP_HOME actually points at. A
-	# toolbox shares $HOME and nothing else, so a path outside it cannot exist.
 	case "$RUSTUP_DIR/" in
 	"$HOME"/*) ;;
 	*)
@@ -94,10 +73,8 @@ else
 		--default-toolchain nightly --component rust-src
 fi
 
-# --- 3. proof ---------------------------------------------------------------
-
 say "Building and running the boot proof."
-# shellcheck disable=SC2086 # RUN and ENV are command prefixes, split on purpose
+# shellcheck disable=SC2086
 $RUN $ENV make -C "$REPO" check
 
 say "Done. To see it on screen:"
