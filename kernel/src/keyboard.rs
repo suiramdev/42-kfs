@@ -10,6 +10,8 @@
 //! the next KFS), so `kmain` asks "anything pressed?" in its idle loop
 //! instead of the keyboard barging in.
 
+use crate::port::inb;
+
 const STATUS_PORT: u16 = 0x64;
 const DATA_PORT: u16 = 0x60;
 
@@ -59,16 +61,4 @@ pub fn poll() -> Option<Key> {
             }
         }
     }
-}
-
-/// # Safety
-/// The port must be one whose read side effect the caller accepts
-/// (reading 0x60 consumes the scancode); `in` cannot fault in ring 0.
-unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    unsafe {
-        core::arch::asm!("in al, dx", in("dx") port, out("al") val,
-                         options(nomem, nostack, preserves_flags));
-    }
-    val
 }

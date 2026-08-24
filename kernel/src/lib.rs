@@ -4,6 +4,7 @@ use core::panic::PanicInfo;
 
 mod keyboard;
 mod klib;
+mod port;
 mod printk;
 mod vga;
 

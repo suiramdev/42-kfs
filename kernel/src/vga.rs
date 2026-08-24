@@ -11,8 +11,9 @@
 //! is concurrent: one CPU, interrupts never enabled, every call rooted
 //! in `kmain`'s single call chain.
 
-use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
+
+use crate::port::outb;
 
 const BUFFER: *mut u16 = 0xb8000 as *mut u16;
 const WIDTH: usize = 80;
@@ -235,15 +236,5 @@ fn sync_hw_cursor() {
         outb(CRTC_DATA, pos as u8);
         outb(CRTC_INDEX, 0x0E);
         outb(CRTC_DATA, (pos >> 8) as u8);
-    }
-}
-
-/// # Safety
-/// The port must be one whose side effects the caller accepts; `out`
-/// itself cannot fault in ring 0.
-unsafe fn outb(port: u16, val: u8) {
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") val,
-             options(nomem, nostack, preserves_flags));
     }
 }
