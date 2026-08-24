@@ -69,61 +69,13 @@ $(NAME): $(KERNEL_BIN) grub.cfg
 run: $(NAME)
 	$(QEMU) -cdrom $(NAME)
 
-# Headless boot proof, asked from outside via the qemu monitor:
-#   1. the guest must reach EIP inside the kernel — within [1 MiB, 2 MiB):
-#      GRUB loaded the multiboot binary and kmain runs instead of the
-#      machine triple-faulting and rebooting. Both bounds matter: GRUB
-#      itself executes below 1 MiB *and* relocated near the top of RAM
-#      (EIP=0x07f7d106 was observed mid-boot), so ">= 1 MiB" alone can
-#      pass while GRUB is still running. Polled rather than a fixed
-#      sleep: boot takes ~4 s natively but can take >5 s inside an
-#      emulated container, so we retry every 2 s for up to 60 s.
-#   2. a frame dump must contain white pixels (the "42" glyphs, attribute
-#      0x0F) and none of GRUB's grey #a8a8a8 leftovers (vga::clear ran).
-# The colour greps scan the raw P6 byte stream, so they rely on the kernel
-# only drawing colours that render without 0xa8 or spurious 0xff bytes:
-# black, white and the bright half of the palette. The dim half (#00a800
-# green, #a80000 red, ...) could reassemble GRUB's grey across adjacent
-# pixel boundaries — keep it off the boot screen.
+# Headless end-to-end proof, asked from outside via the qemu monitor.
+# `tools/check.sh` holds it: the assertions read the guest's segment
+# registers, its physical memory at 0x800, and the text in its VGA
+# buffer, then drive the shell with injected keystrokes. See the script
+# for what each one proves.
 check: $(NAME)
-	@rm -f /tmp/kfs-mon $(BUILD)/screen.ppm
-	@$(QEMU) -cdrom $(NAME) -display none \
-		-monitor unix:/tmp/kfs-mon,server,nowait & echo $$! > $(BUILD)/qemu.pid
-	@eip=; for i in $$(seq 1 30); do \
-		sleep 2; \
-		eip=$$(printf 'info registers\n' \
-			| socat - unix-connect:/tmp/kfs-mon 2>/dev/null \
-			| sed -n 's/.*EIP=\([0-9a-fA-F]*\).*/\1/p' | head -1); \
-		test -n "$$eip" && test $$((0x$$eip)) -ge $$((0x100000)) \
-			&& test $$((0x$$eip)) -lt $$((0x200000)) && break; \
-	done; \
-	test -n "$$eip" \
-		|| { echo "FAIL: qemu monitor unreachable (guest died)"; \
-		     kill $$(cat $(BUILD)/qemu.pid) 2>/dev/null; exit 1; }; \
-	{ test $$((0x$$eip)) -ge $$((0x100000)) && test $$((0x$$eip)) -lt $$((0x200000)); } \
-		|| { echo "FAIL: EIP=$$eip still outside the kernel after 60 s"; \
-		     kill $$(cat $(BUILD)/qemu.pid) 2>/dev/null; exit 1; }; \
-	echo "OK: guest alive, EIP=$$eip inside kernel"
-	@state=none; for i in $$(seq 1 10); do \
-		printf 'screendump $(BUILD)/screen.ppm\n' \
-			| socat - unix-connect:/tmp/kfs-mon > /dev/null 2>&1; \
-		pixels=$$(od -An -v -tx1 $(BUILD)/screen.ppm 2>/dev/null | tr -d ' \n'); \
-		case $$pixels in \
-		*a8a8a8*) state=grey;; \
-		*ffffff*) state=ok; break;; \
-		'') state=none;; \
-		*) state=black;; \
-		esac; \
-		sleep 1; \
-	done; \
-	printf 'quit\n' | socat - unix-connect:/tmp/kfs-mon > /dev/null 2>&1; \
-	kill $$(cat $(BUILD)/qemu.pid) 2>/dev/null || true; \
-	case $$state in \
-	ok) echo "OK: screen cleared and \"42\" glyphs lit";; \
-	grey) echo "FAIL: GRUB's grey text still on screen, vga::clear did not run"; exit 1;; \
-	black) echo "FAIL: no white pixels on screen, \"42\" not displayed"; exit 1;; \
-	*) echo "FAIL: no screen dump produced"; exit 1;; \
-	esac
+	ISO=$(NAME) QEMU=$(QEMU) tools/check.sh
 
 clean:
 	rm -rf $(BUILD)
