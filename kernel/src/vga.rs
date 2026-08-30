@@ -2,7 +2,7 @@ use core::ptr::{read_volatile, write_volatile};
 
 use crate::port::outb;
 
-const BUFFER: *mut u16 = 0xb8000 as *mut u16;
+const BUFFER: *mut u16 = 0xc00b8000 as *mut u16;
 const WIDTH: usize = 80;
 const HEIGHT: usize = 25;
 const CELLS: usize = WIDTH * HEIGHT;
