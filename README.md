@@ -47,7 +47,7 @@ Fedora dependencies:
 ```sh
 sudo dnf install nasm binutils gcc glibc-devel grub2-tools grub2-tools-extra \
                  grub2-pc-modules xorriso mtools qemu-system-x86 socat rustup
-rustup-init -y --default-toolchain nightly --component rust-src
+rustup-init -y --default-toolchain nightly-2026-08-12 --component rust-src
 ```
 
 Debian/Ubuntu equivalents: `nasm binutils gcc libc6-dev grub-pc-bin

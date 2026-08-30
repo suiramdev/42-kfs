@@ -70,7 +70,7 @@ else
 		exit 1
 	fi
 	$RUN $ENV rustup-init -y --no-modify-path \
-		--default-toolchain nightly --component rust-src
+		--default-toolchain nightly-2026-08-12 --component rust-src
 fi
 
 say "Building and running the boot proof."

@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl https://sh.rustup.rs -sSf \
-    | sh -s -- -y --default-toolchain nightly --component rust-src
+    | sh -s -- -y --default-toolchain nightly-2026-08-12 --component rust-src
 
 ENV PATH=/root/.cargo/bin:$PATH
 
