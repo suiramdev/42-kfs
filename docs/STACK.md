@@ -2,22 +2,31 @@
 
 The `stack` command of the shell prints a hex dump of the live kernel stack.
 This file explains what the kernel stack is on this machine, how
-`kernel/src/stack.rs` reads it, what the dump means, and how `make check`
-proves the dump. The shell itself is in [SHELL.md](SHELL.md), and the screen
-under `printk!` is in [VGA.md](VGA.md).
+`kernel/src/stack.rs` reads it, what the dump means, who else calls the
+printer, and how `make check` proves the dump. The shell itself is in
+[SHELL.md](SHELL.md), the screen under `printk!` is in [VGA.md](VGA.md), and
+the fatal path that prints the second dump is in [PANIC.md](PANIC.md).
 
 ## What the kernel stack is here
 
 There is no thread and no process. The kernel stack is one fixed region of
-memory. `boot/boot.asm` reserves 16384 bytes of it in `.bss`, and `_start`
-loads `stack_top` into the stack pointer before it calls `kmain`. Every call in
-this kernel runs on that region.
+memory. `boot/boot.asm` reserves 16384 bytes of it in `.bss`, and the
+higher-half entry loads `stack_top` into the stack pointer before it calls
+`kmain`. Every call in this kernel runs on that region.
 
-`boot.asm` exports both bounds:
+`boot.asm` exports both bounds, after the two page frames that kfs-3 added
+ahead of them:
 
 ```asm
 section .bss
-align 16
+alignb 4096
+global boot_directory
+boot_directory:
+    resb 4096
+global boot_low_table
+boot_low_table:
+    resb 4096
+alignb 16
 global stack_bottom
 stack_bottom:
     resb 16384
@@ -30,14 +39,18 @@ addresses. `stack.rs` declares them as `extern "C"` statics and reads their
 addresses with `addr_of!`. The two functions `top()` and `bottom()` return the
 real bounds of the real build.
 
+kfs-3 moved those bounds. The whole kernel image runs in the higher half now
+([PAGING.md](PAGING.md)), so `.bss` moved with it, and the stack inside `.bss`
+moved too. In the measured build `stack_bottom` is 0xc0110000 and `stack_top`
+is 0xc0114000. The size did not change.
+
 The stack grows down. The part in use is the range from the live stack pointer
 up to `stack_top`. Everything below the stack pointer is free memory, or the
-remains of calls that already returned. In the measured build, `stack_bottom`
-is 0x00103710 and `stack_top` is 0x00107710:
+remains of calls that already returned:
 
 ```
   low addresses
-  0x00103710   stack_bottom  +--------------------------+
+  0xc0110000   stack_bottom  +--------------------------+
                              |                          |
                              |          free            |   the stack
                              |                          |   grows down
@@ -45,12 +58,21 @@ is 0x00103710 and `stack_top` is 0x00107710:
                              |                          |   direction
                              |         in use           |        |
                              |    (the dump window)     |        v
-  0x00107710   stack_top     +--------------------------+
+  0xc0114000   stack_top     +--------------------------+
   high addresses
 ```
 
 One byte below `stack_bottom` overflows the stack. Nothing in this kernel
-detects that today.
+detects that today, and kfs-3 gave the overflow something worth damaging. The
+two reservations directly below the stack are the boot page directory and the
+boot low page table, physical 0x0010e000 and 0x0010f000, and CR3 still holds
+the first of them. A write one byte below the stack lands in a live page table.
+
+`.bss` is 176129 bytes in this build, and the frame bitmap of the physical
+allocator is 128 KiB of that ([MEMORY.md](MEMORY.md)). The stack is unaffected
+by that growth. `boot/boot.asm` reserves it explicitly, so it keeps its own
+16384 bytes wherever `.bss` ends up, and the bitmap and the interrupt
+descriptor table sit above `stack_top` rather than inside the stack.
 
 ## The named data shape
 
@@ -154,10 +176,10 @@ The correct output has no period. Each of these four rows differs from the
 other three:
 
 ```
-00107668  3c 06 10 00 00 00 00 00  97 76 10 00 97 76 10 00 |<........v...v..|
-00107678  00 00 00 00 93 76 10 00  92 76 10 00 05 00 00 00 |.....v...v......|
-00107688  00 00 00 00 00 00 00 00  00 00 73 74 61 63 6b 00 |..........stack.|
-00107698  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
+c0113f30  60 d5 10 c0 a1 36 10 c0  01 00 00 00 00 00 00 00 |`....6..........|
+c0113f40  05 00 00 00 05 00 00 00  01 00 00 00 00 00 00 00 |................|
+c0113f50  72 3f 11 c0 00 00 00 00  00 00 10 00 76 3f 11 c0 |r?..........v?..|
+c0113f60  72 3f 11 c0 05 00 00 00  00 00 00 00 00 00 00 00 |r?..............|
 ```
 
 The fix is one attribute:
@@ -171,10 +193,13 @@ pub fn print(esp: u32, bytes: usize) {
 One attribute keeps the read in the caller. The other keeps the buffer out of
 the caller. Both attributes are necessary, and neither is a hint about speed.
 
-The check now asserts that the first dword of the dump is a return address
-inside the kernel. That single assertion catches this class of defect. A buffer
-inside the window overwrites the return address with a stack address, and a
-stack address fails the range test at once.
+The check asserts that the first dword of the dump lies between 0xc0100000 and
+0xc0200000. Read that assertion for what it is. The range covers the whole
+kernel image, and in the higher half it also covers the kernel stack at
+0xc0110000, so the test no longer tells a stack address from an image address.
+It still rejects a dword that is neither, which is what a dump of the wrong
+region gives. The reliable signature of the alias defect is the period in the
+output, and the four rows above are the reference for a dump that has none.
 
 ## The output format
 
@@ -196,67 +221,136 @@ one character per byte. A byte in the range 0x20 to 0x7e prints as itself, and
 every other byte prints as a full stop.
 
 Bytes appear in memory order. x86 is little-endian, so the lowest byte of a
-value comes first. The saved address 0x0010063c appears in the hex column as
-`3c 06 10 00`. A return address therefore reads backwards, and the reader
+value comes first. The address 0xc01036a1 appears in the hex column as
+`a1 36 10 c0`. A return address therefore reads backwards, and the reader
 assembles it from right to left.
 
-The last row is often partial, because the window is rarely a multiple of 16.
-The hex column pads. `chunk.get(i)` returns `None` for a byte that does not
-exist, and `render` prints three spaces in its place, so the columns stay
-aligned. The text column does not pad. It ends after the real bytes, so the
-partial row is shorter than 77 columns:
-
-```
-00107708  00 00 00 00 1a 00 10 00                          |........|
-```
+The last row is partial when the window is not a multiple of 16. The hex column
+pads. `chunk.get(i)` returns `None` for a byte that does not exist, and `render`
+prints three spaces in its place, so the columns stay aligned. The text column
+does not pad. It ends after the real bytes, so a partial row is shorter than 77
+columns. No captured dump in this build shows one: every measured stack pointer
+is 16-byte aligned, `stack_top` is aligned too, and the panic path asks for
+exactly 64 bytes.
 
 ## How to read a real dump
 
 This is the measured output of one run. The header names the captured stack
-pointer, the top, the bytes in use, and the size of the region. 168 bytes give
-11 rows: ten full rows and one row of 8 bytes. All eleven rows appear below:
+pointer, the top, the bytes in use, and the size of the region. 208 bytes give
+13 rows of 16, with no partial row. All thirteen appear below:
 
 ```
 kfs> stack
-stack: esp 0x00107668 -> top 0x00107710, 168 of 16384 bytes in use
-00107668  3c 06 10 00 00 00 00 00  97 76 10 00 97 76 10 00 |<........v...v..|
-00107678  00 00 00 00 93 76 10 00  92 76 10 00 05 00 00 00 |.....v...v......|
-00107688  00 00 00 00 00 00 00 00  00 00 73 74 61 63 6b 00 |..........stack.|
-00107698  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-001076a8  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-001076b8  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-001076c8  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-001076d8  00 00 00 00 00 00 00 00  00 00 00 00 fc 36 10 00 |.............6..|
-001076e8  08 77 10 00 6b 23 10 00  00 00 00 00 00 00 00 00 |.w..k#..........|
-001076f8  34 32 00 00 00 00 00 00  00 00 00 00 00 00 01 00 |42..............|
-00107708  00 00 00 00 1a 00 10 00                          |........|
+stack: esp 0xc0113f30 -> top 0xc0114000, 208 of 16384 bytes in use
+c0113f30  60 d5 10 c0 a1 36 10 c0  01 00 00 00 00 00 00 00 |`....6..........|
+c0113f40  05 00 00 00 05 00 00 00  01 00 00 00 00 00 00 00 |................|
+c0113f50  72 3f 11 c0 00 00 00 00  00 00 10 00 76 3f 11 c0 |r?..........v?..|
+c0113f60  72 3f 11 c0 05 00 00 00  00 00 00 00 00 00 00 00 |r?..............|
+c0113f70  00 00 73 74 61 63 6b 00  00 00 00 00 00 00 00 00 |..stack.........|
+c0113f80  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
+c0113f90  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
+c0113fa0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
+c0113fb0  00 00 00 00 00 00 00 00  00 00 00 00 02 b0 ad 2b |...............+|
+c0113fc0  00 00 01 00 60 d5 10 c0  f0 3f 11 c0 f1 77 10 c0 |....`....?...w..|
+c0113fd0  00 00 00 00 00 00 00 00  34 32 00 00 00 00 00 00 |........42......|
+c0113fe0  00 00 00 00 02 b0 ad 2b  00 00 01 00 00 00 01 00 |.......+........|
+c0113ff0  00 40 11 c0 0e 10 10 c0  02 b0 ad 2b 00 00 01 00 |.@.........+....|
 kfs>
 ```
 
 Four landmarks in that dump:
 
-- **`3c 06 10 00` at 0x00107668.** These are the first four bytes of the
-  window, and they hold 0x0010063c. That is the return address into
-  `dispatch`. `cmd_stack` calls `stack::esp()` in its own frame, so the window
-  starts in `cmd_stack` and the return address to its caller sits at the
-  bottom. This row is the shortest proof that the dump reads real stack.
-- **`73 74 61 63 6b 00` at 0x00107692.** The text column shows `stack.` The
+- **`60 d5 10 c0` at 0xc0113f30.** These are the first four bytes of the
+  window, and they hold 0xc010d560. `.data` runs from 0xc010d000 to
+  0xc010d56c, so this is a data address that the frame saved, and not a return
+  address; the fatal reports in [PANIC.md](PANIC.md) show the same value in
+  `ebx`. The next four bytes hold 0xc01036a1, which is inside `.text`
+  (0xc0101000 to 0xc010949b), and that is the shape of a return address into
+  the shell. Either way the first row is the shortest proof that the dump reads
+  real stack.
+- **`73 74 61 63 6b 00` at 0xc0113f72.** The text column shows `stack.` The
   line buffer of the shell still holds the word that the operator typed.
   `read_line` writes into a local `[u8; LINE_MAX]` of `run`, and that local
-  lives inside the window, above `cmd_stack`.
-- **`34 32` at 0x001076f8.** The text column shows `42`. `kmain` built the
+  lives inside the window, above the frame that captured the stack pointer. The
+  eight bytes `72 3f 11 c0 05 00 00 00` at 0xc0113f60 are the `&str` that
+  `read_line` returned: the pointer 0xc0113f72 to that buffer, then the length
+  5 for the five letters of `stack`.
+- **`34 32` at 0xc0113fd8.** The text column shows `42`. `kmain` built the
   mandatory `42` with `klib::utoa` into a local buffer, and the bytes remain
   where that dead frame left them. Nothing overwrote them, because the shell
   runs above `kmain` and never returns.
-- **`1a 00 10 00` at 0x0010770c.** These are the last four bytes below
-  `stack_top`, and they hold 0x0010001a. `_start` pushed that address when it
-  ran `call kmain`. It is the deepest return address in the kernel, and the
-  stack pointer was at `stack_top` at that moment.
+- **The last four dwords, 0xc0113ff0 to 0xc0113ffc.** They are the deepest
+  frame in the kernel, and they decode as `boot/boot.asm` wrote them.
+  0xc0113ffc holds 0x00010000, the pointer to the multiboot information
+  structure that GRUB left in low memory. `_start` moved it from `ebx` into
+  `edi`, and `higher_half` pushed it first, so it sits highest. 0xc0113ff8
+  holds 0x2badb002, the multiboot magic that arrived in `eax`, went to `esi`
+  and was pushed second. 0xc0113ff4 holds 0xc010100e, the return address that
+  `call kmain` pushed. 0xc0113ff0 holds 0xc0114000, the `ebp` that `kmain`
+  saved on entry, and `higher_half` had just set `ebp` to `stack_top`. The
+  stack pointer was at `stack_top` when the first push happened.
 
-The other three kinds of value are ordinary. A value inside the range
-0x00103710 to 0x00107710 is a saved stack pointer, or a saved frame register.
-A value below 0x00103710 is a code address or a data address inside the image.
-A run of zeros is untouched `.bss`, or a local that the kernel never wrote.
+The other kinds of value are ordinary. A value inside the range 0xc0110000 to
+0xc0114000 is a saved stack pointer, a saved frame register, or a pointer to a
+local, as 0xc0113f72 is. A value between 0xc0100000 and 0xc0110000 is a code
+address or a data address inside the image. A small value such as 0x00010000 is
+a physical address in low memory, which the low window still maps. A run of
+zeros is untouched `.bss`, or a local that the kernel never wrote.
+
+## The second caller: the fatal panic
+
+Until kfs-3 the shell was the only caller of `print`. The fatal panic path is
+the second one. `panic::machine` prints CR0, CR2, CR3 and the count of
+recovered panics, and then asks for a window of the live stack:
+
+```rust
+let esp = stack::esp();
+if esp >= stack::bottom() && esp < stack::top() {
+    stack::print(esp, 64);
+}
+```
+
+Two decisions sit in those four lines.
+
+The window is 64 bytes and not `WINDOW`. A fatal report has to fit on one
+screen beside five lines of registers, and four rows are enough to show the
+frame that faulted.
+
+The guard is the reason this caller needs any code of its own. `print` reads
+every byte of the window with `read_volatile` through a pointer built from an
+integer. That read is safe on the kernel stack and nowhere else. A panic can
+arrive with a stack pointer that points anywhere: a wild `esp`, a frame that
+overflowed past `stack_bottom`, or a fault taken before the entry stub set `esp`
+at all. A read there can fault again, and a second fault inside the fatal path
+has nowhere to go, because the report is the last thing the machine will ever
+print. So the panic prints the window only when `esp` is inside
+`stack_bottom..stack_top`, and prints nothing at all otherwise.
+[PANIC.md](PANIC.md) covers the rest of the report.
+
+These are the four rows of the captured `fault ro` panic:
+
+```
+stack: esp 0xc0113e10 -> top 0xc0114000, 496 of 16384 bytes in use
+c0113e10  11 00 01 80 00 10 10 c0  00 e0 10 00 00 00 00 00 |................|
+c0113e20  10 3e 11 c0 50 92 10 c0  14 3e 11 c0 50 92 10 c0 |.>..P....>..P...|
+c0113e30  18 3e 11 c0 50 92 10 c0  1c 3e 11 c0 50 8f 10 c0 |.>..P....>..P...|
+c0113e40  f4 3e 11 c0 50 92 10 c0  60 d5 10 c0 70 29 10 c0 |.>..P...`...p)..|
+```
+
+The header still says 496 bytes in use, because that is `stack_top` minus the
+live stack pointer. The dump shows 64 of them, because that is what this caller
+asked for.
+
+The first four dwords are the values that `machine()` was printing one line
+earlier: 0x80010011 is CR0, 0xc0101000 is CR2, 0x0010e000 is CR3, and
+0x00000000 is the count of recovered panics. The eight dwords after them are
+four pairs, one per value: a pointer to the value, then the address of the
+function that formats it. The three registers share the formatter 0xc0109250,
+and the count uses 0xc0108f50 instead, because a count prints as a decimal
+number where the registers print as `{:#010x}`. That array of pairs is how
+`format_args!` hands its arguments to `printk!`, and this window is the
+plainest view of it that the kernel offers. The last row belongs to the frame
+above, and it starts the same shape again.
 
 ## Why there is no frame-pointer backtrace
 
@@ -270,8 +364,9 @@ prints structured nonsense. Structured nonsense is worse than a hex dump,
 because a reader trusts it.
 
 The second is a symbol table. The image carries no symbol table at run time.
-`linker.ld` keeps `.multiboot`, `.text`, `.rodata`, `.data`, `.got` and `.bss`,
-and it discards `.eh_frame` and `.comment`. Nothing maps an address to a name.
+`linker.ld` keeps `.boot` with the multiboot header inside it, then `.text`,
+`.rodata`, `.data` with `.got`, and `.bss`. It discards `.eh_frame` and
+`.comment`. Nothing maps an address to a name.
 
 So an honest backtrace prints bare addresses, and nothing more. A reader must
 resolve every one of them by hand against `nm` or `objdump` on the host. The
@@ -281,9 +376,13 @@ them.
 Two costs make a real backtrace. First, the target file must force the frame
 pointer, which costs a register and a prologue in every function. Second, the
 image must carry a symbol table, which costs bytes in `.rodata` and a build
-step that generates it. Both costs buy nothing until a fault handler needs to
-report where the fault came from. That handler arrives with the interrupt
-descriptor table, so this work belongs with the interrupt work and not here.
+step that generates it.
+
+kfs-3 brought the fault handler that would spend those costs, and it still does
+not need to. The trap frame carries `eip`, `ebp` and `esp` as they were at the
+fault, so the fatal report names the faulting instruction exactly
+([PANIC.md](PANIC.md)). A backtrace would add the chain of callers above that
+instruction, and nothing in the three subjects so far has needed it.
 
 Bytes are true whatever the optimiser did. That is the reason the dump comes
 first.
@@ -292,40 +391,47 @@ first.
 
 `tools/check.sh` drives the shell from outside the guest, over the QEMU human
 monitor. It types `stack` with `sendkey`, reads the text buffer of the screen
-at 0xb8000, and decodes the low byte of every cell. Six of its 20 assertions
-cover the dump:
+at 0xb8000, and decodes the low byte of every cell. `make check` holds 36
+assertions in total, and four of them cover the dump:
 
 ```
-OK: header is self-consistent: 168 of 16384 bytes below 0x00107710
-OK: 168 bytes rendered as 11 rows of 16
-OK: first row starts at 0x00107668, the address the header names
-OK: the first dword is 0x0010063c, a return address inside the kernel
-OK: the ASCII column shows the typed command in the line buffer
-OK: dump esp 0x00107668 is 4 bytes deeper than ESP=0x0010766c
+OK: header is self-consistent: 208 of 16384 bytes below 0xc0114000
+OK: first row starts at 0xc0113f30, the address the header names
+OK: the first dword is 0xc010d560, a kernel pointer from outside the stack
 ```
 
-What each one rules out:
+Those three carry the numbers of the captured dump. The fourth prints two stack
+pointers and the distance between them, both read at run time: the `esp` from
+the dump header, and the live `ESP` that `info registers` reports after the
+dump. The captured screens hold no register read, so its numbers are not
+repeated here. What each assertion rules out:
 
 1. **The header is self-consistent.** The check parses the four numbers out of
    the header. It requires a size of exactly 16384, a stack pointer below the
    top, and a difference that equals the reported bytes in use. This rules out
    a header with a stale bound, a swapped pair, or arithmetic that overflows.
-2. **168 bytes came out as 11 rows of 16.** The check counts the rows and
-   compares against `(used + 15) / 16`. This rules out a dump that drops the
-   partial last row, prints an extra row, or stops early on a short pass.
-3. **The first row starts at the address the header names.** This rules out an
-   address column that prints an offset from zero, or an address that comes
-   from the buffer instead of the source.
-4. **The first dword is a return address inside the kernel.** The check
-   reverses the four bytes and requires a value between 0x00100000 and
-   0x00200000. This rules out the alias defect. A buffer inside the window puts
-   a stack address here, and a stack address is far outside that range.
-5. **The text column shows the typed command.** The check searches the dump rows
-   for the word `stack`. This rules out a text column that prints the hex
-   digits again. It also proves that the bytes are the real line buffer of
-   the shell.
-6. **The captured stack pointer is 4 bytes deeper than the live one.** The
-   check reads `ESP` with `info registers` after the dump. The guest is then
-   one frame shallower, and x86 stacks grow down. So the captured value must
-   sit below the live value, and within 1024 bytes of it. This ties the dump to the
-   CPU, and it rules out a dump of some other region of memory.
+   The size is the one number in the header that the check knows in advance,
+   because `boot/boot.asm` reserves 16384 bytes and nothing else may change
+   that.
+2. **The first row starts at the address the header names.** The check compares
+   the first eight columns of the first row against the `esp` from the header.
+   This rules out an address column that prints an offset from zero, or an
+   address that comes from the buffer instead of the source.
+3. **The first dword is inside the kernel image.** The check reverses the four
+   bytes and requires a value between 0xc0100000 and 0xc0200000. The message
+   calls that value a return address; 0xc010d560 is in `.data`, so the honest
+   reading is narrower. What the assertion proves is that the first dword is an
+   address in the higher half and not a byte offset, a zero, or a value from
+   some other region of memory. The range includes the kernel stack itself, so
+   it does not by itself exclude the alias defect. The period in the output does
+   that, and the four rows in the section above are the reference.
+4. **The captured stack pointer is deeper than the live one.** The check reads
+   `ESP` with `info registers` after the dump. The guest is then one frame
+   shallower, and x86 stacks grow down, so the captured value must sit below the
+   live value and within 1024 bytes of it. This ties the dump to the CPU, and it
+   rules out a dump of some other region of memory.
+
+Two assertions that kfs-2 had are gone. The row count and the text column of
+the line buffer are no longer asserted; `make check` spends its assertions on
+paging, the heaps and the three fatal panics instead, and those are listed in
+[PAGING.md](PAGING.md), [MEMORY.md](MEMORY.md) and [PANIC.md](PANIC.md).

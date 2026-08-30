@@ -1,27 +1,30 @@
 # The debug shell
 
-`kernel/src/shell.rs` holds a prompt, a line editor and a table of six commands.
-`kmain` calls `shell::run` last, and that function never returns. This document
-explains the command table, the line editor and each command. It also explains
-the port I/O module that three drivers share, and the proof from outside the
-guest.
+`kernel/src/shell.rs` holds a prompt, a line editor and a table of fourteen
+commands. `kmain` calls `shell::run` last, and that function never returns. This
+document explains the command table, the argument the table now passes, the
+line editor and each command. It also explains the port I/O module that three
+drivers share, and the proof from outside the guest.
 
 ## What the shell is, and what it is not
 
 The subject asks for a minimal debug shell. The shell here is a prompt, a line,
-and a name. The kernel reads the name, finds it in a table of six commands, and
-calls one function.
+and a name with an optional argument. The kernel reads the name, finds it in a
+table of fourteen commands, and calls one function with the rest of the line.
 
-The shell is not a POSIX shell. It has no arguments, no quotes, no pipes, no
-redirection, no variables, no environment and no job control. It also has no
-file system to name, because this kernel has none. A command is a bare word, and
-nothing else.
+The shell is not a POSIX shell. It has one argument string and nothing more: no
+quotes, no pipes, no redirection, no variables, no environment and no job
+control. It also has no file system to name, because this kernel has none. A
+command is a word, and at most one word after it.
 
-The shell exists for one reason. kfs-2 adds two things that deserve inspection:
-the descriptor table and a dump of the kernel stack. A print at boot shows each
-one once, and then the text scrolls away. A command shows each one at any
-moment. The deep explanation of the two subjects lives in
-[GDT.md](GDT.md) and [STACK.md](STACK.md).
+The shell exists for one reason. Each subject adds machine state that deserves
+inspection. kfs-2 added the descriptor table and the kernel stack. kfs-3 adds
+paging, a frame allocator, two heaps and two panic severities. A print at boot
+shows each one once, and then the text scrolls away. A command shows each one at
+any moment. Four of the eight new commands do more than print: they allocate,
+map, write and fault on purpose. The deep explanation of each subject lives in
+[GDT.md](GDT.md), [STACK.md](STACK.md), [PAGING.md](PAGING.md),
+[MEMORY.md](MEMORY.md) and [PANIC.md](PANIC.md).
 
 ## The command table
 
@@ -29,10 +32,18 @@ moment. The deep explanation of the two subjects lives in
 struct Cmd {
     name: &'static str,
     help: &'static str,
-    run: fn(),
+    run: fn(&str),
 }
 
-static CMDS: [Cmd; 6] = [
+static CMDS: [Cmd; 14] = [
+    Cmd { name: "mem", help: "physical memory, frames and both heaps", run: cmd_mem },
+    Cmd { name: "space", help: "the kernel and user address space layout", run: cmd_space },
+    Cmd { name: "pages", help: "every mapping in the page directory", run: cmd_pages },
+    Cmd { name: "virt", help: "translate an address: virt [addr]", run: cmd_virt },
+    Cmd { name: "alloc", help: "exercise kmalloc, vmalloc, kbrk and vbrk", run: cmd_alloc },
+    Cmd { name: "user", help: "map, use and drop a user space page", run: cmd_user },
+    Cmd { name: "fault", help: "make a page fault: fault [demand|ro|kernel]", run: cmd_fault },
+    Cmd { name: "panic", help: "panic on purpose: panic [oops|fatal]", run: cmd_panic },
     Cmd { name: "stack", help: "hex dump of the live kernel stack", run: cmd_stack },
     Cmd { name: "gdt", help: "the descriptor table, read back from the CPU", run: cmd_gdt },
     Cmd { name: "clear", help: "blank the screen", run: cmd_clear },
@@ -51,9 +62,10 @@ A `match` puts the two jobs in two places. The second place then drifts from the
 first, and the help text becomes a lie. The table removes that failure from the
 design.
 
-Every row has the same shape. The `run` field accepts no argument and returns
-nothing, so the table needs no generic type and no trait object. A new command
-costs one row and one function.
+Every row has the same shape. The `run` field takes one `&str` and returns
+nothing, so the table needs no generic type and no trait object. A command that
+wants no argument names the parameter `_`. A new command costs one row and one
+function.
 
 Two other tables in this kernel make the same choice:
 
@@ -63,12 +75,47 @@ Two other tables in this kernel make the same choice:
 - The colour palette `Color` in `kernel/src/vga.rs`. The enum holds the 16
   hardware values, and the attribute byte comes from arithmetic on them.
 
-`dispatch` trims the line first. It does nothing with an empty line. It prints
-one message for an unknown name:
+## How a line becomes a call
+
+`dispatch` trims the line, then splits it once at the first space. The name is
+the part before the space, and the argument is the rest, trimmed again:
+
+```rust
+fn dispatch(line: &str) {
+    let line = line.trim();
+    let (name, args) = match line.find(' ') {
+        Some(at) => (&line[..at], line[at + 1..].trim()),
+        None => (line, ""),
+    };
+    if name.is_empty() {
+        return;
+    }
+    match CMDS.iter().find(|c| c.name == name) {
+        Some(c) => (c.run)(args),
+        None => printk!("{}: no such command, try `help`\n", name),
+    }
+}
+```
+
+Three rules follow from that shape:
+
+- **An empty line does nothing.** The trim leaves an empty name, and `dispatch`
+  returns before it searches the table. Enter on an empty prompt costs one new
+  prompt and no message.
+- **A line with no space passes the empty string.** `fault` and `fault demand`
+  therefore reach the same function, and `cmd_fault` handles `""` and `"demand"`
+  in one arm. Every command with an argument has a default this way.
+- **An unknown name reports itself.** The message names the word that failed and
+  not the whole line:
 
 ```
 frobnicate: no such command, try `help`
 ```
+
+Only `virt`, `fault` and `panic` read the argument. The other eleven ignore it.
+Nothing splits further, so `virt 0xc0101000 extra` hands the whole string
+`0xc0101000 extra` to `klib::parse_u32`, and that function refuses any byte that
+is not a digit of its radix.
 
 ## The line editor
 
@@ -96,14 +143,118 @@ The editor has five rules:
   line survives the switch.
 
 `keyboard::poll` returns `None` for a key release, a shift key or a dead key. The
-editor then calls `core::hint::spin_loop` and asks again. The loop is a poll,
-because this kernel has no interrupt descriptor table yet.
+editor then calls `core::hint::spin_loop` and asks again. The loop is still a
+poll. kfs-3 installs an interrupt descriptor table, but only to catch faults:
+`sti` appears nowhere, the interrupt controller keeps the mapping the firmware
+left, and no device interrupt ever reaches the CPU. [PANIC.md](PANIC.md)
+explains why that table belongs to the panic work. A keyboard driven by its own
+interrupt belongs to kfs-4.
 
 The two layout tables only produce bytes below 0x80. The collected line is
 therefore valid UTF-8, and `read_line` returns it through
 `core::str::from_utf8_unchecked`.
 
 ## The commands
+
+The order below is the order of `CMDS`, which is also the order that `help`
+prints. Two of the new commands can end the session, in three argument forms:
+`fault ro`, `fault kernel` and `panic fatal` each print a report and then stop
+the processor with `cli; hlt`. `halt` still does the same on request. Every
+other command comes back to the prompt, and that includes the two recovered
+cases, `fault demand` and `panic oops`. A stopped processor needs a reset from
+outside the guest, and `tools/check.sh` uses the monitor command `system_reset`
+for it.
+
+### `mem`
+
+`cmd_mem` prints the whole memory stack in one screen: the RAM that the
+multiboot map declares with one line per usable region, the frame counters of
+the bitmap, the kernel image as virtual and physical bounds, the physical block
+carved for `kmalloc`, and one report per heap with base, break, ceiling, bytes
+used, bytes free, live blocks and backing. It answers the first question after
+any allocation, which is how much is left and where it came from. The
+field-by-field reading is in [MEMORY.md](MEMORY.md).
+
+### `space`
+
+`cmd_space` prints `mem::LAYOUT`, one row per region of the address space, with
+its bounds, its owner and what it holds. The subject asks the kernel to define
+kernel space and user space, and this table of eight regions is that definition
+in a form the operator can read. Both the table and `mem::space_of`, the
+function that answers kernel or user for a single address, are built from the
+same constants in `kernel/src/mem.rs`. [PAGING.md](PAGING.md) explains the
+split and why the low 4 MB stays with the kernel.
+
+### `pages`
+
+`cmd_pages` calls `paging::dump`. That function walks all 1024 directory
+entries, walks every present table under them, and merges each run of pages that
+is contiguous in both the virtual and the physical direction and carries the
+same rights. Seven rows then describe the whole machine at boot. It exists
+because a page table is invisible otherwise: no banner at boot can prove that
+the read-only range is really read only, and this dump names the range and the
+rights together. [PAGING.md](PAGING.md) reads the dump row by row.
+
+### `virt`
+
+`cmd_virt` is the one command with two forms. With no argument it prints one
+summary row for each of seven addresses, chosen so that between them they touch
+the descriptor table, the VGA buffer, the kernel image, both heaps and the
+page-table window. With an argument it parses the text through
+`klib::parse_u32`, which reads hex after `0x` and decimal otherwise, and then
+performs the full walk: directory index, table index, offset, both entries with
+every flag spelled out, and the physical address. A byte that is not a digit of
+its radix makes the command refuse the argument and repeat the example. The
+command turns the arithmetic of 10, 10 and 12 bits into something the operator
+can run on any address. [PAGING.md](PAGING.md) walks the same output.
+
+### `alloc`
+
+`cmd_alloc` is a self test and not a report. It calls `kmalloc` twice, checks
+that `ksize` is at least the request, writes a byte pattern over every byte and
+reads it back, translates two pages of the big block to prove that block is
+physically contiguous, frees both and watches the used counter fall, then does
+the same for `vmalloc` and translates its three frames to show that they are
+scattered. It ends with `kbrk` and `vbrk` in both directions. The last line is
+the verdict, and the measured run prints `alloc: 14 checks passed`. A check that
+fails prints `alloc: FAILED` with a reason and returns to the prompt.
+[MEMORY.md](MEMORY.md) explains what each check defends.
+
+### `user`
+
+`cmd_user` exercises memory rights in user space, on a page it creates and
+destroys. It maps one frame at `0x00c00000` with the user and write bits,
+describes both entries, writes `0x42424242` and reads it back, drops the write
+right and prints the new table entry, asks for a user page inside kernel space
+and gets a recovered oops instead of a mapping, then unmaps the page and shows
+that translation finds nothing there. Memory rights are a claim about hardware,
+and this command makes the hardware answer it. [PAGING.md](PAGING.md) covers the
+entry bits, and [PANIC.md](PANIC.md) covers the refusal.
+
+### `fault`
+
+`cmd_fault` makes the CPU fault on purpose, and its argument names the kind.
+`fault` and `fault demand` read `0x00800000` in the user demand zone: the page
+is absent, the handler takes a frame and maps it, the instruction runs again,
+and the read returns zero after one yellow oops line. `fault ro` writes to
+`0xc0101000`, the kernel's own code, which is present and read only.
+`fault kernel` writes to `0xd1800000`, kernel space with no page. Those two are
+fatal and stop the processor. Any other word prints
+`fault: say demand, ro or kernel`. The three cases together are the proof that
+the handler separates a fault it can repair from one it cannot.
+[PANIC.md](PANIC.md) reads each report field by field.
+
+### `panic`
+
+`cmd_panic` reaches the two panic macros with no CPU fault involved. `panic` and
+`panic oops` call `koops!`, which prints one yellow line, counts it and returns,
+so the prompt comes back. `panic fatal` calls `kpanic!`, which prints in red,
+dumps CR0, CR2, CR3, the count of recovered panics and a 64-byte window of the
+live stack, and then halts the processor. Any other word prints
+`panic: say oops or fatal`. The subject asks for the difference between a panic
+the kernel walks away from and one it does not, and this command shows both
+without a memory bug anywhere. [PANIC.md](PANIC.md) is the whole story, and
+[STACK.md](STACK.md) covers the stack window in the fatal report.
 
 ### `stack`
 
@@ -114,23 +265,27 @@ a short dump.
 
 ```
 kfs> stack
-stack: esp 0x00107668 -> top 0x00107710, 168 of 16384 bytes in use
-00107668  3c 06 10 00 00 00 00 00  97 76 10 00 97 76 10 00 |<........v...v..|
-00107678  00 00 00 00 93 76 10 00  92 76 10 00 05 00 00 00 |.....v...v......|
-00107688  00 00 00 00 00 00 00 00  00 00 73 74 61 63 6b 00 |..........stack.|
-00107698  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-001076a8  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-001076b8  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-001076c8  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-001076d8  00 00 00 00 00 00 00 00  00 00 00 00 fc 36 10 00 |.............6..|
-001076e8  08 77 10 00 6b 23 10 00  00 00 00 00 00 00 00 00 |.w..k#..........|
-001076f8  34 32 00 00 00 00 00 00  00 00 00 00 00 00 01 00 |42..............|
-00107708  00 00 00 00 1a 00 10 00                          |........|
+stack: esp 0xc0113f30 -> top 0xc0114000, 208 of 16384 bytes in use
+c0113f30  60 d5 10 c0 a1 36 10 c0  01 00 00 00 00 00 00 00 |`....6..........|
+c0113f40  05 00 00 00 05 00 00 00  01 00 00 00 00 00 00 00 |................|
+c0113f50  72 3f 11 c0 00 00 00 00  00 00 10 00 76 3f 11 c0 |r?..........v?..|
+c0113f60  72 3f 11 c0 05 00 00 00  00 00 00 00 00 00 00 00 |r?..............|
+c0113f70  00 00 73 74 61 63 6b 00  00 00 00 00 00 00 00 00 |..stack.........|
+c0113f80  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
+c0113f90  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
+c0113fa0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
+c0113fb0  00 00 00 00 00 00 00 00  00 00 00 00 02 b0 ad 2b |...............+|
+c0113fc0  00 00 01 00 60 d5 10 c0  f0 3f 11 c0 f1 77 10 c0 |....`....?...w..|
+c0113fd0  00 00 00 00 00 00 00 00  34 32 00 00 00 00 00 00 |........42......|
+c0113fe0  00 00 00 00 02 b0 ad 2b  00 00 01 00 00 00 01 00 |.......+........|
+c0113ff0  00 40 11 c0 0e 10 10 c0  02 b0 ad 2b 00 00 01 00 |.@.........+....|
 ```
 
 The header names the stack pointer, the top of the kernel stack, the bytes in
 use and the size of the whole stack. The stack grows down, so the part in use is
-the range from the stack pointer up to the top.
+the range from the stack pointer up to the top. Both bounds moved into the
+higher half in kfs-3. The region is `0xc0110000..0xc0114000` now, and
+`boot/boot.asm` still reserves the same 16384 bytes for it.
 
 A row is 77 columns:
 
@@ -140,15 +295,19 @@ A row is 77 columns:
 - The printable characters between two `|` marks. A byte outside 0x20 to 0x7e
   prints as a full stop.
 
-Bytes appear in memory order, and x86 is little-endian. The saved address
-0x0010063c therefore appears as `3c 06 10 00`.
+Bytes appear in memory order, and x86 is little-endian. The address 0xc01036a1
+therefore appears as `a1 36 10 c0`.
 
-Three parts of this dump have a name. The first four bytes are the return
-address into `dispatch`, which the call to `cmd_stack` pushed. The bytes
-`73 74 61 63 6b 00` are the shell line buffer, which still holds the word
-`stack`. The bytes `34 32` are the text `42` that `kmain` left on the stack.
-[STACK.md](STACK.md) covers the copy, the overlap defect and the absent
-backtrace.
+Four parts of this dump have a name. The first four bytes hold 0xc010d560, which
+is inside `.data` and not inside `.text`, so it is a saved register and not a
+return address; the fatal reports in [PANIC.md](PANIC.md) show the same value in
+`ebx`. The bytes `73 74 61 63 6b 00` are the shell line buffer, which still
+holds the word `stack`. The bytes `34 32` are the text `42` that `kmain` left on
+the stack. The last four dwords below `stack_top` are what `boot/boot.asm` and
+the prologue of `kmain` pushed at the very first call. [STACK.md](STACK.md)
+names each one, covers the copy, the alias defect and the absent backtrace, and
+describes the second caller of the printer: the fatal panic path prints a
+64-byte window of its own.
 
 ### `gdt`
 
@@ -226,10 +385,11 @@ driver.
    controller drops a byte that arrives into a full buffer. Command 0xfe pulls
    the CPU reset line low, because the 8042 drives that line on a PC.
 2. **A deliberate triple fault.** The code loads the table register for
-   interrupts with base 0 and limit 0. It then runs `int3`. The CPU cannot find
-   the breakpoint handler, cannot find the double-fault handler either, and the
-   third fault stops the processor. Every chipset wires that stop to a reset.
-   Linux reboots the same way.
+   interrupts with base 0 and limit 0. kfs-3 installed a real table there
+   ([PANIC.md](PANIC.md)), so this step throws it away on purpose. It then runs
+   `int3`. The CPU cannot find the breakpoint handler, cannot find the
+   double-fault handler either, and the third fault stops the processor. Every
+   chipset wires that stop to a reset. Linux reboots the same way.
 
 If both mechanisms fail, `cmd_reboot` calls `cmd_halt`, and the machine stops in
 a state that the operator can see.
@@ -253,6 +413,14 @@ The order on screen is the order in the table.
 
 ```
 kfs> help
+  mem     physical memory, frames and both heaps
+  space   the kernel and user address space layout
+  pages   every mapping in the page directory
+  virt    translate an address: virt [addr]
+  alloc   exercise kmalloc, vmalloc, kbrk and vbrk
+  user    map, use and drop a user space page
+  fault   make a page fault: fault [demand|ro|kernel]
+  panic   panic on purpose: panic [oops|fatal]
   stack   hex dump of the live kernel stack
   gdt     the descriptor table, read back from the CPU
   clear   blank the screen
@@ -264,9 +432,12 @@ kfs> help
 ## Port input and output
 
 x86 has two address spaces. A memory-mapped device answers at an ordinary
-address, and the VGA text buffer at 0xb8000 is one. The rest of the devices
-answer in a separate space of 65 536 slots, and only the `in` and `out`
-instructions reach that space.
+address, and the VGA text buffer is one. Its frame is still physical 0xb8000,
+and the kernel now writes it through the kernel-space alias 0xc00b8000. The
+kernel window maps the first 4 MB of RAM at 0xc0000000, so that address and the
+identity address 0x000b8000 reach the same frame ([VGA.md](VGA.md)). The rest of
+the devices answer in a separate space of 65 536 slots, and only the `in` and
+`out` instructions reach that space.
 
 Three modules need those two instructions:
 
@@ -293,8 +464,12 @@ socket. Nothing inside the guest takes part, so a kernel that only claims to wor
 cannot pass. `make check` runs the script.
 
 The script types with the monitor command `sendkey`. `sendkey` has no string
-form, so `type_line` splits the word into characters and sends one `sendkey` per
-character, and then one `sendkey ret`.
+form, so `type_line` splits the line into characters and sends one `sendkey` per
+character, and then one `sendkey ret`. kfs-3 added one translation to that loop.
+Commands take arguments now, and the monitor calls the space bar `spc`, so
+`type_line` rewrites every space as `_` while it splits the line, and sends
+`sendkey spc` for that placeholder. Without the translation no assertion could
+type `virt 0xc0100000` or `fault ro`.
 
 The injected key reaches the queue of the emulated 8042. The status bit on port
 0x64 rises from queue occupancy alone, so the polled driver reads the key with no
@@ -317,40 +492,50 @@ with an address and a colon.
 
 ## The shell assertions
 
-`tools/check.sh` holds 20 assertions and all of them pass. These come from the
-shell:
+`tools/check.sh` holds 36 assertions and all of them pass. Nineteen of them are
+driven by injected keystrokes, so the whole input path runs before the assertion
+can look at the screen at all: `help`, `mem`, `space`, `pages`,
+`virt 0xc0100000`, `alloc` (two assertions), `user`, `fault demand`,
+`panic oops`, `stack` (four assertions), `reboot`, `fault ro`, `fault kernel`,
+`panic fatal` and `halt`. The other seventeen read registers, physical memory
+and the screen after boot, and need no keystroke.
+
+These are the assertions about the shell itself:
 
 - `OK: shell prompt is on screen`. This rules out a kernel that reaches `kmain`
-  and never reaches `shell::run`, and a shell that starts and prints nothing.
+  and never reaches `shell::run`, and a shell that starts and prints nothing. It
+  is the one shell assertion that types nothing.
 - ``OK: `help` lists the commands``. This rules out a broken input path. The key
   reached the 8042, the polled driver read it, the editor stored it, Enter ended
   the line, and `dispatch` found the row. The script greps the help text of
-  `stack`, so the text also comes from `CMDS`.
-- ``OK: `gdt` reads the table back from the CPU and agrees with the source``. The
-  script greps `as declared`, which rules out a table that the source declares
-  and the CPU does not use. It also greps `kernel stack`, which rules out a table
-  without the kernel stack descriptor at selector 0x18.
-- ``OK: `clear` blanked the screen``. The script fails when the screen holds no
-  character at all. A screen with no prompt means that `clear` ran and the shell
-  died. This assertion rules out a `clear` that takes the shell down with the
-  text.
-- `OK: header is self-consistent: 168 of 16384 bytes below 0x00107710`. The size
-  matches the 16384 bytes that `boot/boot.asm` reserves. The stack pointer is
-  below the top, and the difference equals the count in the header.
-- `OK: 168 bytes rendered as 11 rows of 16`. No byte of the window is absent from
-  the output.
-- `OK: first row starts at 0x00107668, the address the header names`. The address
-  column holds a real address and not an offset.
-- `OK: the first dword is 0x0010063c, a return address inside the kernel`. This
-  rules out the overlap defect. A copy buffer inside the window makes the dump
-  periodic and puts a stack address in this position.
-- `OK: the ASCII column shows the typed command in the line buffer`. The dump
-  covers the frame of `run`, and a human reader recognises the content.
-- `OK: dump esp 0x00107668 is 4 bytes deeper than ESP=0x0010766c`. The check ties
-  the number in the dump to the register that the CPU reports. x86 stacks grow
-  down, so the captured value must sit below the live one.
-- ``OK: `reboot` restarted the machine, and the table came back at 0x00000800``.
-  This rules out a reboot that hangs the machine. It also proves that
-  `gdt::install` converges on the same state at every boot.
+  `mem`, so the text also comes from `CMDS`.
+- ``OK: `virt` walks directory 768, table 256 down to physical 0x00100000``.
+  This is the assertion that proves arguments work end to end. The script types
+  `virt 0xc0100000`, so the space arrived as `spc`, `dispatch` split the line at
+  it, `klib::parse_u32` read the hex, and the walk printed the two indices, the
+  offset and the physical address.
+- ``OK: `panic oops` prints and returns, this panic is not fatal``. The script
+  greps the message, then greps `kfs>` again. A prompt after a panic is the
+  proof that a recovered panic really comes back to the shell.
+- ``OK: `reboot` restarted the machine, the table and paging came back``. This
+  rules out a reboot that hangs the machine. It also proves that `gdt::install`
+  and the paging setup converge on the same state at every boot.
 - ``OK: `halt` stopped the processor (HLT=1)``. The flag comes from
   `info registers`, so a busy loop that only looks stopped fails here.
+- The three fatal cases end with the same shape: ``OK: a write to read only
+  kernel code panics and stops the processor``, ``OK: a write to unmapped kernel
+  space panics and stops the processor`` and ``OK: `panic fatal` prints, dumps
+  the machine and stops the processor``. Each one types its command, greps the
+  report, and then requires `HLT=1`. A stopped processor cannot type the next
+  command, so the script sends the monitor command `system_reset` after each of
+  the three and waits for `42` and the prompt before it goes on.
+
+Two commands carry no assertion of their own. `clear` is typed eight times, as
+the screen-clearer before the next case, and every assertion after one of those
+would fail on a `clear` that took the shell down with the text. `gdt` no longer
+has one either: the check reads GDTR and the seven descriptors at physical 0x800
+straight out of the machine, which proves the table without trusting the command
+that prints it ([GDT.md](GDT.md)). The assertions for `stack` and for the eight
+new commands live in the documents that own the subject:
+[STACK.md](STACK.md), [PAGING.md](PAGING.md), [MEMORY.md](MEMORY.md) and
+[PANIC.md](PANIC.md).

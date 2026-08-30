@@ -8,19 +8,21 @@ One idea underpins all of them. Every program you have ever written ran *on top
 of* an operating system. `printf`, `malloc`, `open`, `import`, `Promise` — all
 of those are, sooner or later, requests to a kernel. This project *is* the thing
 that would have answered them. There is nothing underneath it: no files, no
-heap, no threads, no `println!`. Dereference a bad pointer and no one kills your
-process; the machine reboots.
+threads, no `println!`, and no heap until kfs-3 built one out of the frames it
+found in RAM. Dereference a bad pointer and no one kills your process: since
+kfs-3 the kernel catches the fault itself, prints the address and the registers,
+and stops the processor.
 
 "**Here:**" marks where the concept shows up in this repository.
 
 ## Start here
 
-If the whole vocabulary is new, read these eight in this order and the rest will
-have somewhere to attach:
+If the whole vocabulary is new, read these eleven in this order and the rest
+will have somewhere to attach:
 
 **Kernel**, **Bare metal / freestanding**, **Bootloader**, **Multiboot
 specification**, **Entry point**, **Linker script**, **Triple fault**,
-**`no_std`**.
+**`no_std`**, **Page**, **Page table**, **Page fault**.
 
 ---
 
@@ -45,8 +47,13 @@ RAM, and whatever hardware you program yourself. Here: `"os": "none"` in
 `kernel/i686-kfs.json`.
 
 **Kernel space / user space** — the privileged half of a running system versus
-the sandboxed half where applications live. kfs-1 is entirely kernel space;
-there is no sandbox to be inside.
+the sandboxed half where applications live. kfs-1 had the words only: every
+address belonged to the kernel. kfs-3 makes the split a property of the address
+space. Kernel space is `0xC0000000` and above, plus the identity-mapped first
+4 MB; user space is `0x00400000..0xBFFFFFFF`, and its pages carry the U/S bit
+set, which is what would let ring 3 reach them. `paging::map_page` refuses a
+user page at a kernel address. Nothing runs in ring 3 yet, so user space is a
+set of rights with no tenant ([PAGING.md](PAGING.md)).
 
 **Ring 0** — x86's name for its most privileged level, the one a kernel runs in;
 ordinary applications get ring 3. Our code is in ring 0 from its very first
@@ -63,10 +70,19 @@ one. Not implemented here: there is no user space to knock on the door.
 **Driver** — kernel code that knows one specific device's private protocol.
 The VGA text output ([VGA.md](VGA.md)) is this kernel's first driver.
 
-**Panic** — a bug the program has decided it cannot survive. In userland
-something catches it and kills your process; here nobody is listening, so a
-panic can only stop the machine. Here: the `#[panic_handler]` in
-`kernel/src/lib.rs` prints the panic in bright red, then spins forever.
+**Panic / kernel panic** — a bug the program has decided it cannot survive. In
+userland something catches it and kills your process; here nobody is listening,
+so a panic stops the machine. Here: `kpanic!` prints the reason in bright red,
+dumps CR0, CR2, CR3 and 64 bytes of stack, then runs `cli` and `hlt` for good.
+Rust's own `panic!` ends in the same place, because the `#[panic_handler]` in
+`kernel/src/lib.rs` calls the fatal path ([PANIC.md](PANIC.md)).
+
+**Oops (recovered panic)** — a fault the kernel can repair, reported rather
+than fatal. Linux's word for it, and this kernel's answer to the subject's "all
+panics are not fatal". Here: `koops!` prints in yellow, adds one to a counter,
+and returns to its caller. A refused allocation, a double free and a page fault
+inside the demand zone are all oopses, and every fatal report ends with how
+many came before it: "0 recovered before this one" on a clean boot.
 
 ---
 
@@ -101,6 +117,36 @@ from the live value, so the first address of a dump is the stack pointer itself.
 
 **EFLAGS** — the register holding one-bit facts about the CPU: was the last
 comparison equal, are interrupts enabled, did the last addition overflow.
+
+**Control register (CR0 to CR4)** — the registers that configure the CPU itself
+rather than hold data: which modes are on, where the page directory lives. They
+are not general-purpose, no arithmetic reaches them, and only a `mov` in ring 0
+can read or write one. Here: `kernel/src/paging.rs` reads CR0, CR2 and CR3
+through inline assembly, and `boot.asm` writes CR3 and CR0 to switch paging on.
+
+**CR0** — the oldest switchboard: bit 0 PE protected mode, bit 4 ET, bit 16 WP
+write protect, bit 31 PG paging. It reads `0x80010011` in this kernel, which is
+those four bits and nothing else. Setting bit 31 is the instant paging begins.
+
+**CR2** — written by the CPU when a page fault happens, and holding the address
+that faulted. Nothing else writes it, and it is only meaningful inside the
+fault handler. Here: printed as `cr2` on every fault report, and read by
+`paging::handle_fault` to decide whether the fault can be repaired.
+
+**CR3** — the physical address of the page directory, so the CPU knows where
+translation starts. Writing it, even with the same value, empties the
+translation cache. It reads `0x0010e000` in this build, and `make check`
+compares that against the address the kernel prints for its own directory.
+
+**CR4** — the later feature switches: PSE for 4 MB pages, PAE for 36-bit
+addressing, PGE for global pages. This kernel never writes it, which is one way
+of saying 4 kb pages only, no PAE, no global pages.
+
+**Write protect (CR0.WP)** — bit 16 of CR0. Without it the read-only bit in a
+page table binds ring 3 only, and kernel code may write any page it can see.
+With it the CPU refuses a ring 0 write to a read-only page, which is what makes
+"memory rights" mean something in a kernel that never leaves ring 0. Here: set
+at the end of `paging::init`, and proven by the shell's `fault ro`.
 
 **Real mode** — the 16-bit mode the CPU wakes up in: 1 MiB of addressable
 memory, no memory protection, 1978 rules. The BIOS and GRUB's first stage run
@@ -164,7 +210,8 @@ prints such a descriptor as an empty range instead of a healthy-looking limit.
 **Accessed bit** -- bit 0 of the access byte. The CPU sets it in the descriptor
 *in memory* the first time its selector is loaded, so the table you authored is
 not byte-for-byte the table you read back: an authored `0x92` returns `0x93`.
-`tools/check.sh` masks that one bit.
+`tools/check.sh` masks that one bit. A page-table entry has a bit of the same
+name in a different place; see **Accessed bit (A) and dirty bit (D)** below.
 
 **Null descriptor** -- entry 0 of the table, which must be eight zero bytes.
 The CPU refuses to load selector 0, and that is what turns an uninitialised
@@ -195,33 +242,89 @@ change.
 
 **Interrupt** — an event that makes the CPU drop what it is doing and jump to a
 handler: a key press, a timer tick, a division by zero. It is a callback the
-hardware invokes whether your code was ready or not. Interrupts arrive disabled
-at boot and stay disabled here, because we have installed no handlers.
+hardware invokes whether your code was ready or not. Device interrupts arrive
+disabled at boot and stay disabled here: `sti` appears nowhere, the PIC is
+never remapped, and the keyboard is still read by polling. kfs-3 handles the
+CPU's own exceptions only, which is what a fault report needs; devices are
+kfs-4's work.
 
 **IDT** — the Interrupt Descriptor Table, the array mapping interrupt numbers to
-handler addresses. Not implemented yet, so there is nothing for an interrupt to
-call. The shell exploits that: `reboot`'s fallback loads a table register with
-base 0 and limit 0, so no vector can be fetched at all.
+handler addresses. kfs-3 installs one: 256 slots, of which the first 32 hold
+real gates, at `0xc0114004` in this build. Its address goes into the CPU with
+`lidt`, the interrupt-table twin of `lgdt`. Here: `kernel/src/idt.rs`
+([PANIC.md](PANIC.md)). The shell still exploits an empty table on purpose:
+`reboot`'s fallback replaces the live one with a table of base 0 and limit 0,
+so no vector can be fetched at all.
+
+**Vector** — the number that identifies an interrupt or an exception, and the
+index of its row in the IDT. Vectors 0 to 31 belong to the CPU: 0 is divide by
+zero, 8 double fault, 13 general protection fault, 14 page fault. Here:
+`kernel/src/idt.rs` names all 32, which is how a report can say "page fault
+(vector 14)" instead of a bare number.
+
+**Interrupt gate** — one 8-byte row of the IDT: the code selector to enter, the
+32-bit address of the handler split across two halves, and a type byte. Every
+gate here is type `0x8e` with selector `0x08`: present, ring 0, 32-bit
+interrupt gate. An interrupt gate clears the interrupt flag on entry; a trap
+gate, the other choice, leaves it alone.
+
+**Stub (interrupt stub)** — the few assembly instructions a vector actually
+points at, needed because the CPU does not tell the handler which vector it
+was, and pushes an error code for some vectors but not others. Here: the
+`isr_plain` and `isr_error` macros in `kernel/src/idt.rs` push a zero where the
+CPU pushed no error code, push the vector number, and jump to `isr_common`,
+which is the one place that saves registers and calls Rust. 32 stubs, a table
+of their addresses in `.rodata`, and one handler.
+
+**`pusha`** — one instruction that pushes all eight general-purpose registers;
+`popa` pops them back. It is how `isr_common` turns the CPU's own pushes plus
+the register set into the `Frame` struct the Rust handler reads field by field.
+
+**`iret`** — the return from an interrupt handler: it pops EIP, CS and EFLAGS
+together, which an ordinary `ret` cannot do. Here: the last instruction of
+`isr_common`, reached only when the fault was recovered, since a fatal one
+never returns.
 
 **Exception** — an interrupt the CPU raises about itself: invalid opcode, page
-fault, division by zero. Same idea as a hardware-level thrown error, except
-there is no `catch` anywhere.
+fault, division by zero. Same idea as a hardware-level thrown error. Since
+kfs-3 there is exactly one `catch`: a page fault inside the user demand zone is
+repaired and the faulting instruction runs again. Every other exception prints
+a report and stops the machine.
 
 **Triple fault** — the CPU faults, faults again while handling that fault,
-faults a third time, gives up and resets. With no IDT this is what *any* CPU
-exception does to us, and from outside it looks like the machine rebooting in a
-loop. It is the kernel-land equivalent of a segfault, except nothing catches it.
-Here: `make check` rules it out by proving the guest settles inside the kernel
-and stays there. The shell's `reboot` command also causes one on purpose, as
-its fallback: it loads an interrupt table of length zero and runs `int3`, so
-the CPU cannot find the handler, cannot find the double-fault handler either,
-and the third fault stops the processor, which the chipset wires to a reset.
-Linux reboots the same way ([SHELL.md](SHELL.md)).
+faults a third time, gives up and resets. Before kfs-3 there was no IDT, so
+*any* CPU exception ended this way, and from outside it looked like the machine
+rebooting in a loop. With the 32 exception vectors wired, a triple fault now
+takes deliberate work. It is the kernel-land equivalent of a segfault, except
+nothing catches it. Here: `make check` rules out the accidental kind by proving
+the guest settles inside the kernel and stays there. The shell's `reboot`
+command still causes one on purpose, as its fallback: it loads an interrupt
+table of length zero and runs `int3`, so the CPU cannot find the handler,
+cannot find the double-fault handler either, and the third fault stops the
+processor, which the chipset wires to a reset. Linux reboots the same way
+([SHELL.md](SHELL.md)).
 
 **Paging / MMU** — the hardware that translates the addresses your code uses
-into real addresses in RAM, and so lets every process pretend it owns memory
-from zero upwards. Not enabled here: every address in this kernel is a physical
-address.
+into real addresses in RAM, and so lets code use memory that is not where it
+claims to be, or is not there at all. kfs-3 switches it on: `boot.asm` sets bit
+31 of CR0, and every address after that instruction is a virtual address. The
+vocabulary of tables, entries, rights and faults has a section of its own
+below ([PAGING.md](PAGING.md)).
+
+**TLB (translation lookaside buffer)** — the CPU's cache of translations it has
+already worked out, so that a memory access does not cost two extra table reads
+every time. It is a cache with no coherency: edit a page table and the CPU may
+keep using the stale translation until something tells it not to. Most mappings
+that "should have worked" fail here.
+
+**`invlpg`** — the instruction that drops one page's cached translation.
+Cheaper than emptying the cache, and enough after a single mapping change.
+Here: `paging::invalidate`, called from `map_page`, `unmap_page` and `protect`,
+so no caller has to remember it.
+
+**TLB flush** — emptying the whole cache, done on 32-bit x86 by writing CR3
+back into itself. Here: `paging::flush`, used once, when the kernel installs
+its own page table over the boot one.
 
 **Red zone** — an optimisation where a function scribbles in the 128 bytes just
 below the stack pointer without formally reserving them. Fine in userland, fatal
@@ -238,10 +341,14 @@ cheaper than initialising hardware the kernel does not use. Here: `"features":
 integer instructions instead of hardware float instructions. Slow, but it works
 on a chip whose FPU nobody turned on.
 
-**MMIO (memory-mapped I/O)** — a memory address that is really a device: writing
-to it changes hardware instead of storing a value. The VGA text screen at
-`0xb8000` is MMIO, which is why writes to it must be `volatile` — the compiler
-must not optimise away a write whose whole point is the side effect.
+**MMIO (memory-mapped I/O)** — a memory address that is really a device:
+writing to it changes hardware instead of storing a value. The VGA text screen
+is MMIO, which is why writes to it must be `volatile` — the compiler must not
+optimise away a write whose whole point is the side effect. Since kfs-3 the
+driver writes to `0xc00b8000` rather than `0xb8000`: paging gives the same
+physical cells a second virtual address inside kernel space, and the screen
+cannot tell the difference. Two virtual addresses for one frame is an ordinary
+mapping, not a trick.
 
 **Port I/O** — x86's other way of reaching devices, using `in` and `out`
 instructions on a separate, small address space of its own. Here: the hardware
@@ -298,9 +405,10 @@ which is why the multiboot magic `0x1BADB002` appears in the binary as
 through `ESP`. Nobody hands a kernel one; it reserves memory and points `ESP` at
 it. On x86 the stack grows *downwards*, so the initial pointer is the *highest*
 address of the reserved region. Here: 16 KiB in `.bss`, with `esp` starting at
-`stack_top` = `0x107710` and `stack_bottom` at `0x103710`. `boot.asm` exports
-both ends, so the shell's `stack` command can dump the part in use
-([STACK.md](STACK.md)).
+`stack_top` = `0xc0114000` and `stack_bottom` at `0xc0110000`. Those are
+kernel-space addresses since kfs-3: the stack sits inside the kernel image and
+is reached through the higher-half mapping. `boot.asm` exports both ends, so the
+shell's `stack` command can dump the part in use ([STACK.md](STACK.md)).
 
 **Stack frame** -- the slice of the stack that belongs to one call: the return
 address the call pushed, saved registers, and that function's own locals. The
@@ -313,6 +421,279 @@ as two-digit hex, then the printable ones as characters. Here: 16 bytes to a
 row and 77 columns per row ([STACK.md](STACK.md)). The bytes come out in memory
 order, so on a little-endian machine a saved address reads backwards, and
 `0x0010063c` appears as `3c 06 10 00`.
+
+---
+
+## Memory and paging
+
+kfs-3 puts hardware between a pointer and RAM. Until now every address this
+kernel used was a real address on a memory chip, and every byte of RAM was
+equally reachable and equally writable. Now the CPU translates each address
+through two tables the kernel writes itself, a page can be read-only, absent or
+owned by user space, and asking for memory means asking an allocator this
+kernel had to build first. These words name that machinery
+([PAGING.md](PAGING.md), [MEMORY.md](MEMORY.md), [PANIC.md](PANIC.md)).
+
+**Page** — a fixed-size, fixed-aligned block of an address space: 4 KiB here,
+and the unit everything below counts in. Presence, rights and translation are
+decided per page, never per byte, which is why a kernel that wants its code
+read-only must first know which pages hold code. This kernel uses 4 kb pages
+and nothing else.
+
+**Page frame** — a page-sized block of *physical* memory, and what a page is
+mapped to. A page is an address; a frame is RAM. QEMU's default machine gives
+32 639 frames of 4 kb, of which 24 263 are still free once low memory, the
+kernel image and the kmalloc block are accounted for (`mem`).
+
+**Virtual address** — the address the code uses, and the only kind of address a
+pointer in this kernel holds once paging is on. It means nothing to the memory
+chips: the CPU has to look it up first. `0xc0101000` is a virtual address; the
+byte it names lives at physical `0x00101000`.
+
+**Linear address** — the address that comes out of segmentation and goes into
+paging. On x86 an address is computed, the segment base is added to it, and the
+result is what paging translates. Every segment here is flat with base 0, so a
+virtual address and a linear address are the same number. It matters once:
+`lgdt` takes a *linear* address, so the descriptor table at physical `0x800`
+needs linear `0x800` to keep pointing at it, which is one reason the first 4 MB
+stays identity mapped.
+
+**Physical address** — the address that reaches the memory bus, the one RAM and
+devices answer to. Only three things here deal in physical addresses: CR3, the
+table entries, and the frame allocator. Everything else works in virtual
+addresses. `paging::translate` converts one into the other, and the `virt`
+command prints both.
+
+**Address translation** — the lookup itself: the CPU splits the address into
+three fields, reads one entry from the directory, one from the table that entry
+names, and adds the offset to the frame it finds.
+
+| bits | field | selects |
+|---|---|---|
+| 31..22 | directory index, 0..1023 | which page table |
+| 21..12 | table index, 0..1023 | which page inside it |
+| 11..0 | offset, 0..4095 | which byte inside the page |
+
+**Offset within a page** — the low 12 bits of an address, carried through
+translation untouched. That is why a mapping can only move memory in 4 KiB
+steps, and why an entry needs to store 20 bits of address rather than 32.
+Here: `paging::offset`, printed as the `offset` column of `virt`.
+
+**Page directory** — the upper of the two tables: one page holding 1024
+four-byte entries, each covering 4 MB of address space. CR3 holds its physical
+address. Here: `boot_directory` in `boot/boot.asm`, at physical `0x0010e000` in
+this build, filled by the entry stub before paging is switched on.
+
+**Page table** — the lower level: one page of 1024 entries, each describing one
+4 KiB page. A directory entry that is not present has no table at all, which is
+how a 4 GB address space costs a few pages instead of 4 MB of tables. Here: the
+boot low table, the static kernel-window table at physical `0x00138000`, and
+one table per 4 MB region the allocators touch.
+
+**Page directory entry (PDE)** — one 32-bit word of the directory: the top 20
+bits are the physical address of a page table, the low 12 are flags. `pages`
+and `virt` print them raw. `0x00138023` is the entry for `0xc0000000`: table at
+`0x00138000`, present, writable, accessed.
+
+**Page table entry (PTE)** — one 32-bit word of a table, the same shape as a
+PDE but naming the frame itself. `0x00101021` maps `0xc0101000` to frame
+`0x00101000`, present and accessed, with the write bit clear because that page
+holds kernel code.
+
+**Present bit (P)** — bit 0 of an entry. Clear means "nothing here": the CPU
+raises a page fault instead of translating, and the other 31 bits are the
+kernel's to use as it likes. Every mapping helper checks it first, and
+`paging::get_page(addr, create)` allocates a fresh table when a directory entry
+is not present.
+
+**Read/write bit (R/W)** — bit 1. Clear makes the page read-only. It constrains
+ring 0 only when CR0.WP is set, which this kernel does, so the twelve pages
+`0xc0101000..0xc010cfff` genuinely cannot be written by the code inside them.
+Here: `paging::init` clears it for kernel code and read-only data,
+`paging::protect` changes it afterwards, and `fault ro` proves it.
+
+**Supervisor bit (U/S)** — bit 2, misleading only in its name: set means user
+code may touch the page, clear means ring 0 only. Kernel pages leave it clear;
+`paging::USER_PAGE` sets it. `paging::map_page` refuses a user page at a kernel
+address and reports an oops instead of mapping it.
+
+**Accessed bit (A) and dirty bit (D)** — bits 5 and 6, both written by the CPU
+and never by the kernel: A on the first read or write through the page, D on
+the first write. A system that swaps clears them to find pages worth evicting.
+This kernel only reads them, so they record what has been touched:
+`virt 0xc0101000` prints `a 1 d 0` for code that has run but was never written,
+and `user` prints `a 1 d 1` for a page it has just stored into.
+
+**Page size bit (PS)** — bit 7 of a *directory* entry. Set, the entry maps a
+single 4 MB page and there is no second level. It is 0 everywhere here, so
+every present directory entry names a real table and every mapping is 4 kb.
+Using it would also mean enabling PSE in CR4.
+
+**Global bit (G)** — bit 8, which asks the CPU to keep a translation across a
+CR3 reload. It exists for kernel mappings, which are identical in every address
+space. This kernel names the flag and never sets it: with one address space
+there is nothing to keep it for, and it needs CR4.PGE to have any effect.
+
+**Identity mapping** — a mapping where the virtual address equals the physical
+address, so translation changes nothing. It is what a kernel needs for the
+addresses hardware and firmware handed it. Here: the first 4 MB, supervisor
+only, which keeps the descriptor table at `0x800`, the VGA cells at `0xb8000`
+and GRUB's multiboot information reachable at the numbers other code already
+believes. The cost is that user space starts at 4 MB instead of 0.
+
+**Higher-half kernel** — a kernel that lives in the top part of every address
+space, leaving the bottom to user code. The i386 convention splits at
+`0xC0000000`, three quarters of the way up, and that is what this kernel does:
+its bytes are loaded at physical `0x00100000` and its code runs at `0xC0101000`
+upwards. The gain is that the kernel keeps the same addresses whatever runs
+below it.
+
+**Recursive page directory entry** — the trick of pointing a directory entry at
+the directory itself. Entry 1023 does that here, which makes every live page
+table appear in the address space without mapping any of them by hand. Without
+it the kernel would have to map a frame temporarily each time it wanted to edit
+a table, because a table's own frame is otherwise reachable through no address.
+
+**Page-table window** — the address range that trick produces: the table for
+directory slot *n* at `0xFFC00000 + n * 4096`, and the directory itself at
+`0xFFFFF000`, since it is the table of slot 1023. Writing to `0xFFF00000` edits
+the table that maps the kernel window. `pages` lists the three tables this
+kernel keeps live and nothing else.
+
+**Page fault** — the exception the CPU raises when translation fails or the
+rights refuse the access: vector 14. CR2 holds the address, an error code says
+what was attempted, and the faulting instruction has not run. It is the
+mechanism behind every "segmentation fault" you have seen, from the other side:
+here it is our handler that decides what happens next.
+
+**Error code** — the word the CPU pushes for a page fault, describing the
+attempt rather than the address: bit 0 the page was present, bit 1 the access
+was a write, bit 2 it came from user code. `0x00000003` is a write to a page
+that was present, so the rights refused it; `0x00000002` is a write to a page
+that was not there. Both appear in the reports of `fault ro` and
+`fault kernel`.
+
+**Demand paging** — mapping a page only when someone first touches it, instead
+of up front. It is how a real system promises more memory than it commits.
+Here: `0x00800000..0x008fffff` has no pages at boot; a fault inside that range
+makes `paging::handle_fault` take a frame, zero it, map it as a user page and
+let the instruction run again. `fault demand` reads the first address of the
+range and gets `0x00000000` back from a page that did not exist a moment
+earlier.
+
+**Multiboot memory map** — the list GRUB leaves behind describing RAM: for each
+region a base, a length and a type, where type 1 means usable. A kernel cannot
+guess this, because RAM has holes. Here: `kernel/src/multiboot.rs` reads up to
+12 usable regions, clamps them to 32 bits, and falls back to the older
+`mem_lower`/`mem_upper` pair when no map is present. `mem` prints what it
+found: `0x00000000..0x0009fc00` and `0x00100000..0x07fe0000`, 130 559 kb in two
+regions on QEMU's default machine.
+
+**Reserved memory** — memory that exists but must not be handed out: anything
+the loader did not call usable, plus whatever the kernel is already using.
+Here: `pmm::reserve` marks the whole first 1 MB, which holds the BIOS area, the
+descriptor table and the VGA cells, and then the kernel image at physical
+`0x00101000..0x0013a000`. Everything left is fair game, which is why the
+reservations have to happen before the first allocation.
+
+**Frame allocator** — the bottom of the memory stack: the code that hands out
+physical frames and takes them back, with nothing underneath it to ask. Here:
+`kernel/src/pmm.rs`, with `pmm::alloc_frame` for one frame, `pmm::alloc_range`
+for consecutive frames, `pmm::free_frame` to give one back and `pmm::carve` for
+a block kept aside.
+
+**Bitmap allocator** — a frame allocator that keeps one bit per frame. Simple,
+fixed in size, and cheap to search a machine word at a time. Here: 1 << 20 bits
+for the whole 4 GB a 32-bit address can name, 128 KB in `.bss`, where a set bit
+means free. Zero-initialised therefore reads as "nothing is free", so the map
+is safe before any code runs and costs no bytes in the image.
+
+**Carved block** — one long run of consecutive frames taken from the allocator
+at boot and kept for a single purpose. Here: `pmm::carve` asks for a quarter of
+usable RAM capped at 32 MB, halving its request until a run fits, and gives the
+result to `kmalloc`. In this build the block is physical
+`0x0013a000..0x02119000`, 32 636 kb, and it is what makes every kmalloc pointer
+physically contiguous.
+
+**Physically contiguous / virtually contiguous** — consecutive in RAM, versus
+consecutive only in the address space. Paging makes the second cheap and the
+first scarce, and hardware that reads memory on its own needs the first. Here:
+this is the whole difference between the two allocators. `kmalloc(5000)`
+crosses a page boundary inside the carved block, and its two halves are at
+physical `0x0013a050` and `0x0013b050`; `vmalloc(12288)` is one run of
+addresses over frames `0x0211a000`, `0x0211c000` and `0x0211d000`, in that
+order, and its caller cannot tell.
+
+**Out of memory** — the case every allocator has to answer for. There is no
+swapping here and nothing to reclaim, so the answer is a refusal, and the
+refusal must not be a crash. Here: `pmm::alloc_frame` returns `None`, `kmalloc`
+and `vmalloc` return a null pointer, the reason is reported with `koops!`, and
+the kernel carries on. Failing to carve the kmalloc block at boot is the one
+memory failure that is fatal, because nothing sensible can follow it.
+
+**Heap** — a region of memory an allocator hands out in pieces of whatever size
+the caller asks for, rather than in whole pages. `malloc` gives you one; a
+kernel has to build its own. Here: two of them, `0xd0000000..0xd1ffffff` for
+`kmalloc` and `0xe0000000..0xefffffff` for `vmalloc`, both empty at boot and
+both growing a page at a time ([MEMORY.md](MEMORY.md)).
+
+**Break (`brk` / `sbrk`)** — the top of a heap: the first address past the part
+that has memory behind it. Moving the break is how a heap grows and shrinks.
+Unix's `sbrk` returns the *old* break, so the caller knows where the space it
+just gained begins, and `heap::kbrk` and `heap::vbrk` keep that: `kbrk(+4096)`
+reports "break was 0xd0003000, now 0xd0004000". The delta is rounded up to
+whole pages, since a page is the smallest thing that can be mapped, and a
+refused move returns a null pointer.
+
+**Block header** — the few bytes an allocator keeps in front of every block to
+remember what it handed out. Here: 8 bytes, a size and a used flag, so the
+pointer a caller receives is always its block plus 8, and the first `kmalloc`
+of a boot returns `0xd0000008`. It is also what makes `ksize` possible: the
+size is one read backwards from the pointer.
+
+**Boundary tag** — the classic name for that arrangement: every block carries
+its own tag at its boundary, so the heap is a walkable list needing no separate
+index, and `kfree` needs nothing but the pointer. Textbook boundary tags repeat
+the tag as a footer, which lets a block merge with the block *before* it in
+constant time. This kernel keeps the header only, so merging works forwards,
+and `kfree` validates a pointer by walking the list from the base rather than
+trusting it.
+
+**First fit** — take the first free block big enough, instead of looking for
+the best one. It is the cheapest policy that works, and it is what
+`heap::Heap::first_fit` does, absorbing free neighbours as it walks. Best fit
+wastes less and pays a full scan every time.
+
+**Splitting** — cutting the tail off an oversized free block so the remainder
+stays usable. Here: a block is split only when what is left can hold a header
+and the smallest payload, 16 bytes together; below that the caller quietly gets
+the few extra bytes.
+
+**Coalescing** — merging free blocks that touch, so that freeing two
+neighbours yields one block big enough for something. Without it a heap decays
+into unusable crumbs. Here: done while searching rather than while freeing —
+`first_fit` folds each following free block into the one it is looking at.
+
+**Fragmentation** — free memory that cannot be used because of its shape rather
+than its total. It is the reason an allocator with plenty free can still refuse
+a request.
+
+**Internal fragmentation** — the waste inside what was handed out: rounding,
+alignment and the header itself. Here every request is rounded up to 8 bytes
+and pays an 8-byte header, so `kmalloc(1)` costs 16 bytes of heap and `ksize`
+reports 8.
+
+**Double free** — freeing the same pointer twice. In userland it corrupts the
+allocator and the crash arrives later somewhere else, which is what makes it
+such a hard bug. Here the header says whether the block is in use, so the
+second `kfree` is caught, reported as an oops, and ignored.
+
+**Dangling pointer** — a pointer to memory that has been freed or unmapped. A
+freed heap pointer still points at mapped memory here, so reading through it
+returns stale bytes instead of faulting, which is exactly why `kfree` and
+`ksize` check the header rather than trusting the address. An unmapped pointer
+is louder: after the `user` command unmaps its page, `paging::translate` says
+there is nothing there and touching it would be a page fault.
 
 ---
 
@@ -352,7 +733,7 @@ this project uses. It reads a config file, loads a kernel image, prepares the CP
 
 **GRUB module** — a piece of GRUB itself that GRUB loads on demand: filesystem
 drivers, video drivers. `grub-mkrescue` copies its whole module tree onto the
-ISO, which is why a 17 KB kernel yields a 2.7 MB image. The Makefile passes
+ISO, which is why a 62 KB kernel yields a 2.7 MB image. The Makefile passes
 `--fonts= --locales= --themes=` to leave GRUB's optional data out: on Fedora
 the font and the translations alone would push the image past the subject's
 limit.
@@ -393,7 +774,9 @@ here.
 **Load address** — where an image's contents are placed in physical memory. Ours
 is 1 MiB (`0x100000`), the conventional lowest address a kernel may claim, since
 below it live the BIOS data area, the interrupt vector table, the VGA
-framebuffer and mapped ROM.
+framebuffer and mapped ROM. Since kfs-3 it is no longer the address the code
+runs at: the kernel is loaded at physical `0x00101000` and runs at `0xC0101000`
+(see **VMA / LMA**).
 
 **ISO 9660** — the filesystem format used on CD-ROMs. `kfs.iso` is one.
 
@@ -521,11 +904,18 @@ to put our code.
 - `.note.GNU-stack` — a marker declaring whether the stack must be executable.
 - `.multiboot` — *our* custom section name, so the linker script can place the
   header first.
+- `.boot` — *our* second custom section, holding the entry stub that runs
+  before paging: `linker.ld` gives it the same virtual and load address,
+  `0x00100000`, because at that moment a higher-half address maps to nothing.
 
 **NOBITS** — the ELF flag meaning "occupies memory but has no bytes in the
-file". `.bss` is NOBITS: 16 KiB of RAM, 0 bytes on disk. It says "reserve 16 KiB
-of zeros in RAM" rather than "ship 16 KiB of zeros inside the file" — closer to
-`calloc` than to a literal array in the binary.
+file". `.bss` is NOBITS: RAM at boot, 0 bytes on disk. It says "reserve this
+many zeros in RAM" rather than "ship them inside the file" — closer to `calloc`
+than to a literal array in the binary. kfs-3 leans on it: `.bss` now holds the
+boot page directory, the boot page table, the 16 KiB stack and the 128 KB frame
+bitmap, 176 129 bytes of memory for no image size at all. All-zero also happens
+to be the safe state of the frame bitmap, which reads as "no frame is free", so
+no code is needed to initialise it.
 
 **Symbol** — a name attached to an address, so other code can refer to it
 without knowing the number (`kmain`, `stack_top`).
@@ -559,12 +949,25 @@ it. The multiboot header is the one section that needs `KEEP`, because nothing
 in the program refers to it and GRUB finds it by scanning the file.
 
 **VMA / LMA** — a section's virtual address (where the code believes it is) and
-its load address (where it is actually put). Identical here, because paging is
-off.
+its load address (where it is actually put). They were identical until kfs-3,
+because paging was off. Now they differ for the whole kernel: `.text` has VMA
+`0xc0101000` and LMA `0x00101000`. GRUB copies the bytes to the LMA with paging
+off; the code in them is compiled for the VMA and only becomes correct once the
+directory maps one onto the other. The entry stub is the exception, and has to
+be: `.boot` keeps VMA = LMA = `0x00100000`, because it is what runs before any
+mapping exists.
+
+**`AT()`** — the linker-script clause that sets a section's load address
+independently of its virtual address. `.text : AT(ADDR(.text) - KERNEL_SPACE)`
+places `.text` for a CPU that believes in `0xc0101000` while telling the loader
+to write the bytes at `0x00101000`. Without it the linker assumes the two are
+equal, and GRUB would try to write 3 GB up in a machine with 128 MB of RAM.
 
 **Segment / program header** — the loader's view of an ELF: which byte ranges to
-copy to which addresses with which permissions. Our kernel has one `LOAD`
-segment, 14 088 bytes on disk expanding to 42 517 in RAM.
+copy to which addresses with which permissions. Our kernel has two `LOAD`
+segments since kfs-3: the entry stub, 97 bytes at `0x00100000` with its virtual
+and physical addresses equal, and the kernel proper, 50 540 bytes on disk
+expanding to 229 377 in RAM, virtual `0xc0101000` and physical `0x00101000`.
 
 **Static library / archive (`.a`)** — a bundle of object files in one file.
 `cargo` emits `libkernel.a` — a bag of parts rather than a finished program — so
@@ -713,8 +1116,8 @@ can see or touch. It reports CPU state, dumps the screen, pauses and resets the
 machine — a debugger attached to the emulated hardware rather than to a process.
 Exposed here on a unix socket with `-monitor unix:/tmp/kfs-mon,server,nowait`.
 Its text form is the **human monitor**, and `tools/check.sh` speaks it: all
-twenty assertions of `make check` are monitor round trips, and nothing inside
-the guest takes part in any of them.
+thirty-six assertions of `make check` are monitor round trips, and nothing
+inside the guest takes part in any of them.
 
 **`info registers`** — the monitor command printing the guest's CPU registers.
 The `EIP` it reports is the proof that the kernel is executing. It prints the

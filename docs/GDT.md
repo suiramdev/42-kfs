@@ -117,8 +117,8 @@ All six segments have a base of `0x00000000` and a limit of `0xfffff` with the
 granularity flag set, which is 4 GiB. They differ only in the access byte, which
 carries the type and the ring. A flat segment maps every linear address to
 itself, so segmentation adds nothing to an address. That is the correct choice
-here, because the next KFS project brings paging. Paging then becomes the
-mechanism for memory protection.
+here, because paging now carries memory protection. Rights are a property of a
+page in this kernel, not of a segment; see [PAGING.md](PAGING.md).
 
 An x86 stack segment is a data segment. Intel requires a writable data
 descriptor in `ss`. The kernel stack descriptor is therefore byte-identical to
@@ -139,6 +139,29 @@ reasons keep that form out of this kernel:
   the kernel takes from the stack, and then reads back through `ds`, would
   resolve at a different place.
 
+## Segmentation and paging together
+
+Since kfs-3 an address goes through two translations, in this order:
+
+1. **Segmentation.** The CPU takes the offset in the instruction and adds the
+   base of the segment that the selector names. The result is a linear address.
+2. **Paging.** The linear address goes through the page directory and a page
+   table, and the result is a physical address.
+
+The first step is the identity function in this kernel. Every base is
+`0x00000000` and every limit covers 4 GiB, so the linear address equals the
+offset, and no segment refuses an access that paging allows. That is why the
+descriptors can stay flat. Everything the subject calls memory rights lives in
+the R/W and U/S bits of a page entry, and [PAGING.md](PAGING.md) describes
+them.
+
+The order also explains why the user descriptors in the table still describe
+nothing that runs. A ring 3 descriptor takes effect only when the CPU is in
+ring 3, and nothing here enters ring 3: no far return to a user selector, no
+task state segment. The privilege split that is real today is the U/S bit in
+the page tables, and at rest every mapping that the `pages` command prints
+reads `kernel`.
+
 ## The address 0x00000800
 
 The table sits at physical `0x00000800`. Seven descriptors of 8 bytes each
@@ -158,18 +181,23 @@ the multiboot information structure. A write at `0x00000800` cannot reach any of
 them.
 
 The kernel copies the table to `0x00000800` at run time. It does not ask the
-linker to place it there. `linker.ld` pins the whole image at 1 MiB:
+linker to place it there. `linker.ld` starts the image at 1 MiB and gives every
+section a load address at or above that point:
 
 ```
-. = 1M;
-.multiboot : { KEEP(*(.multiboot)) }
-.text      : { *(.text*) }
+    . = KERNEL_LOAD;
+    .boot ALIGN(4K) : { KEEP(*(.multiboot)) *(.boot) }
+
+    . += KERNEL_SPACE;
+    .text : AT(ADDR(.text) - KERNEL_SPACE) { *(.text*) }
 ```
 
 A second load segment in the first page would land in memory that the BIOS and
 GRUB still use during the load of the image. The copy avoids that conflict
 completely. Only 56 bytes of data move down, and they move after the handoff.
-Every instruction stays at 1 MiB.
+No part of the image is loaded below 1 MiB. `KERNEL_LOAD` is `0x00100000` and
+`KERNEL_SPACE` is `0xC0000000`, so `.text` runs at a higher-half address while
+it loads low; [PAGING.md](PAGING.md) explains that split.
 
 ## The install sequence
 
@@ -231,14 +259,16 @@ the low words untouched. Every other bit of every descriptor still has to match.
 ## The proof
 
 `tools/check.sh` proves the table from outside the guest, through the QEMU human
-monitor. Nothing inside the guest takes part in the proof. Four assertions cover
-the table:
+monitor. The kernel never reports on its own table: the monitor reads the
+register and the bytes of memory directly. `make check` holds 36 assertions
+since the memory work, and five of them cover the table:
 
 ```
-OK: GDT at 0x00000800, limit 0x00000037 (7 descriptors)
+OK: GDT still at 0x00000800, limit 0x00000037 (7 descriptors)
 OK: cs=0008 ss=0018 ds=es=fs=gs=0010, all from the new table
 OK: null + kernel code/data/stack + user code/data/stack at 0x800
-OK: `gdt` reads the table back from the CPU and agrees with the source
+OK: the low window 0x00000000-0x00400000 is mapped, the GDT lives there
+OK: `reboot` restarted the machine, the table and paging came back
 ```
 
 Each assertion rules out a different failure:
@@ -252,11 +282,20 @@ Each assertion rules out a different failure:
 - The third reads guest physical memory at `0x800` with `xp/14wx`. It compares
   all 14 words against the source. This assertion rules out a correct table
   register that points at wrong bytes, and it rules out a wrong access byte.
-- The fourth types the `gdt` command into the guest and reads the text back from
-  the VGA buffer. `cmd_gdt` calls `sgdt` through `gdt::current()`, so the shell
-  reports the table that the CPU uses and not the table that the source
-  declares. A mismatch prints `DOES NOT MATCH THE SOURCE`. See
-  [SHELL.md](SHELL.md) for the output of that command.
+- The fourth reads `info mem`, which lists the mappings that the CPU's own
+  tables describe, and requires the range `0-400000 -rw`. Without that range,
+  linear `0x00000800` names nothing. This assertion rules out a directory that
+  builds the higher half and forgets the low window.
+- The fifth types `reboot`, waits for the banner to come back, and reads the
+  table register and CR0 again. It rules out a table, or a page directory, that
+  only the first boot gets right.
+
+The shell's `gdt` command is the same read from inside the guest. `cmd_gdt`
+calls `sgdt` through `gdt::current()`, so it reports the table that the CPU
+uses and not the table that the source declares, and a mismatch prints
+`DOES NOT MATCH THE SOURCE`. `make check` no longer types it, because the third
+assertion compares the same bytes from outside. See [SHELL.md](SHELL.md) for
+the output of that command.
 
 The first assertion caught a real defect during development. The code computed
 the limit from the size of the Rust helper array, and not from the count of
@@ -274,14 +313,31 @@ use, so the two cannot disagree:
 pub const LIMIT: u16 = (SEGMENTS.len() * core::mem::size_of::<u64>() - 1) as u16;
 ```
 
-## What comes next
+## What paging changed
 
-Two hazards wait in the next projects:
+The two hazards that this file predicted both arrived with kfs-3, and
+[PAGING.md](PAGING.md) describes the answers in full.
 
-- The table register holds a linear address, not a physical one. Paging turns
-  `0x00000800` into a virtual address. A page directory without an identity map
-  for the first page therefore invalidates the table register, and the next
-  segment load faults.
-- A physical page allocator reads the memory map from GRUB and sees the first
-  page as free memory. That allocator must exclude `0x00000800` to `0x00000837`,
-  or a later allocation overwrites the live descriptor table.
+The table register holds a linear address, not a physical one. Paging is on
+before `kmain` runs, so `gdt::install()` writes its 56 bytes to linear
+`0x00000800`, and `lgdt` loads a linear base. Both still reach physical
+`0x00000800`, because directory entry 0 maps the first 4 MB of linear addresses
+to the first 4 MB of memory. That identity window exists for this reason above
+all others. Remove it, and the table register names memory that nothing maps,
+so the next segment load faults. The window is supervisor only, because entry
+0 has its U/S bit clear, and it costs one thing: user space starts at 4 MB
+instead of 0, which is why `mem::USER_BASE` equals `mem::LOW_WINDOW_END`. The
+`virt` command prints the mapping that the register depends on:
+
+```
+kfs> virt
+ address     dir  table offset physical    rights
+ 0x00000800     0     0   2048 0x00000800  rw kernel
+```
+
+A physical page allocator reads the memory map from GRUB and sees the first
+page as free memory. `mem::init` therefore calls `pmm::reserve(0, BIOS_END)`
+before any allocation runs, and that takes the whole first megabyte out of
+circulation: the descriptor table at `0x00000800`, the VGA buffer at
+`0x000b8000`, the BIOS data area, and the boot page tables. See
+[MEMORY.md](MEMORY.md).
