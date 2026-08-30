@@ -9,7 +9,7 @@ BOOT_TIMEOUT=${BOOT_TIMEOUT:-60}
 
 VGA_TEXT=0xb8000
 CELLS=2000
-COLUMNS=80
+WIDTH=80
 GDT_BASE=00000800
 GDT_LIMIT=00000037
 
@@ -23,7 +23,7 @@ dumped() {
 }
 
 screen() {
-	dumped "xp/${CELLS}hx $VGA_TEXT" 4 | cut -c5-6 | awk -v w=$COLUMNS '
+	dumped "xp/${CELLS}hx $VGA_TEXT" 4 | cut -c5-6 | awk -v w=$WIDTH '
 		BEGIN { for (i = 0; i < 16; i++) v[substr("0123456789abcdef", i + 1, 1)] = i }
 		{
 			b = v[substr($0, 1, 1)] * 16 + v[substr($0, 2, 1)]
