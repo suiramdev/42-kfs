@@ -106,9 +106,11 @@ shell or a bare `make` may never read; the Makefile falls back to
 The failure the script exists to prevent is a quiet one. Without the BIOS boot
 modules (`grub2-pc-modules` on Fedora, `grub-pc-bin` on Debian),
 `grub-mkrescue` still writes an ISO and says nothing: a ~380 KB one with no
-boot sector, on which the guest never leaves the BIOS. `make check` catches it
-(`EIP=0x0000b78c`, real-mode SeaBIOS, outside the kernel), which is exactly why
-the script ends by running it.
+boot sector, on which the guest never leaves the BIOS. The build refuses that
+image now — the ISO rule asks `xorriso` for the El Torito boot record and fails
+when there is none — and `make check` catches it too (`EIP=0x0000b78c`,
+real-mode SeaBIOS, outside the kernel), which is exactly why the script ends by
+running it.
 
 ## Running it
 

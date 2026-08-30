@@ -632,11 +632,15 @@ Worth knowing:
 - `cargo` is a **phony** target. Cargo's own change detection is better than
   anything Make could model for Rust, so Make always delegates. The cost is
   that `kernel.bin` relinks every build, and linking 17 KB is free.
-- Three assertions run inside the build rather than as separate steps:
+- Four assertions run inside the build rather than as separate steps:
   `grub-file --is-x86-multiboot` on the linked binary; `nm -u` on it, because
   an undefined symbol there is a host library the kernel expects and GRUB
   cannot provide, which is precisely what `-nostdlib` promises will not
-  happen; and a size check that fails the build above 10 485 760 bytes.
+  happen; a size check that fails the build above 10 485 760 bytes; and an
+  El Torito check on the ISO, because without the GRUB i386-pc modules
+  `grub-mkrescue` writes a bootless image and reports success. Two of the four
+  print an `OK:` line, and those two are the first two assertions of section 6;
+  the other two say nothing unless they fail.
 - `check` is a single line: it hands the ISO to `tools/check.sh`, which holds
   the twenty assertions of section 6.
 - `clean` / `fclean` / `re` follow 42 conventions. `clean` also runs

@@ -10,6 +10,7 @@ RUSTFLAGS     ?= -C panic=abort -C no-redzone=y -Z stack-protector=none
 GRUB_MKRESCUE ?= $(shell command -v grub-mkrescue || command -v grub2-mkrescue)
 GRUB_FILE     ?= $(shell command -v grub-file || command -v grub2-file)
 GRUBFLAGS      = --fonts= --locales= --themes=
+XORRISO       ?= xorriso
 QEMU          ?= qemu-system-i386
 CARGO         ?= $(shell command -v cargo || echo $(or $(CARGO_HOME),$(HOME)/.cargo)/bin/cargo)
 NM            ?= nm
@@ -44,6 +45,11 @@ $(NAME): $(KERNEL_BIN) grub.cfg
 	cp $(KERNEL_BIN) $(ISODIR)/boot/kernel.bin
 	cp grub.cfg $(ISODIR)/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) $(GRUBFLAGS) -o $@ $(ISODIR)
+	@$(XORRISO) -indev $@ -report_el_torito plain 2>/dev/null \
+		| grep -q 'El Torito boot img.*BIOS' \
+		|| { echo "FAIL: $@ carries no BIOS boot image, it will not boot."; \
+		     echo "      Install the GRUB i386-pc modules (grub2-pc-modules on"; \
+		     echo "      Fedora, grub-pc-bin on Debian) and rebuild."; exit 1; }
 	@size=$$(stat -c %s $@ 2>/dev/null || stat -f %z $@); \
 	test $$size -le $(MAX_ISO_SIZE) \
 		|| { echo "FAIL: $@ is $$size bytes, over $(MAX_ISO_SIZE)"; exit 1; }; \
