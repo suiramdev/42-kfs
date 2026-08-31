@@ -1300,9 +1300,10 @@ nothing.
 ```
 NASM 2.16.01
 GNU ld (Binutils) 2.40
-rustc 1.100.0-nightly
+rustc 1.99.0-nightly (3d6c19bb9 2026-08-11), the pinned nightly-2026-08-12
 grub-mkrescue (GRUB) 2.06
-QEMU 7.2.22 (qemu-system-i386)
+xorriso 1.5.4
+QEMU 11.0.3 (qemu-system-i386)
 ```
 
 Sizes and addresses shift a little with other versions. The structure does not.
