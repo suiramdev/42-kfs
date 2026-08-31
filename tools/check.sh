@@ -20,12 +20,27 @@ fail() { echo "FAIL: $1"; exit 1; }
 
 mon() { printf '%s\n' "$*" | socat - "unix-connect:$SOCK" 2>/dev/null | tr -d '\r'; }
 
+# Closing the connection while the monitor is mid-reply wedges it for the
+# rest of the run. For commands with long replies, hold stdin open and leave
+# only after the output has gone quiet, so the reply is drained to its end.
+ask() {
+	{ printf '%s\n' "$*"; sleep 2; } \
+		| socat -T 0.75 - "unix-connect:$SOCK" 2>/dev/null | tr -d '\r'
+}
+
 dumped() {
-	mon "$1" | grep '^[0-9a-f]\{8,\}: ' | grep -o "0x[0-9a-f]\{$2\}"
+	ask "$1" | grep '^[0-9a-f]\{8,\}: ' | grep -o "0x[0-9a-f]\{$2\}"
 }
 
 screen() {
-	dumped "xp/${CELLS}hx $VGA_TEXT" 4 | cut -c5-6 | awk -v w=$WIDTH '
+	tries=0
+	cells=
+	while [ "$(printf '%s\n' "$cells" | grep -c .)" -ne "$CELLS" ]; do
+		[ $tries -lt 3 ] || break
+		tries=$((tries + 1))
+		cells=$(dumped "xp/${CELLS}hx $VGA_TEXT" 4)
+	done
+	printf '%s\n' "$cells" | cut -c5-6 | awk -v w=$WIDTH '
 		BEGIN { for (i = 0; i < 16; i++) v[substr("0123456789abcdef", i + 1, 1)] = i }
 		{
 			b = v[substr($0, 1, 1)] * 16 + v[substr($0, 2, 1)]
@@ -38,25 +53,45 @@ row() {
 	screen | sed -n "$(($1 + 1))p"
 }
 
+prompt_line() {
+	screen | grep 'kfs> ' | tail -1 | sed 's/.*kfs> //; s/ *$//'
+}
+
 type_line() {
-	for char in $(printf '%s\n' "$1" | sed 's/ /_/g; s/./& /g'); do
-		case $char in
-		_) mon "sendkey spc" > /dev/null ;;
-		*) mon "sendkey $char" > /dev/null ;;
-		esac
+	attempt=0
+	while [ $attempt -lt 3 ]; do
+		attempt=$((attempt + 1))
+		for char in $(printf '%s\n' "$1" | sed 's/ /_/g; s/./& /g'); do
+			case $char in
+			_) mon "sendkey spc" > /dev/null ;;
+			*) mon "sendkey $char" > /dev/null ;;
+			esac
+		done
+		sleep 1
+		echoed=$(prompt_line)
+		[ "$echoed" = "$1" ] && break
+		erase=$(printf '%s' "$echoed" | wc -c)
+		while [ "$erase" -gt 0 ]; do
+			mon "sendkey backspace" > /dev/null
+			erase=$((erase - 1))
+		done
 	done
 	mon "sendkey ret" > /dev/null
 	sleep 2
+	if [ "$(prompt_line)" = "$1" ]; then
+		mon "sendkey ret" > /dev/null
+		sleep 2
+	fi
 }
 
-registers() { mon info registers; }
+registers() { ask info registers; }
 
 control() {
 	registers | sed -n "s/.*$1=\([0-9a-f]*\).*/\1/p" | head -1
 }
 
 mappings() {
-	mon "info mem" \
+	ask "info mem" \
 		| sed -n 's/^0*\([0-9a-f]\{1,8\}\)-0*\([0-9a-f]\{1,8\}\) [0-9a-f]* \(.*\)/\1-\2 \3/p'
 }
 
