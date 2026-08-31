@@ -471,6 +471,13 @@ Commands take arguments now, and the monitor calls the space bar `spc`, so
 `sendkey spc` for that placeholder. Without the translation no assertion could
 type `virt 0xc0100000` or `fault ro`.
 
+The typed line is verified before it runs. After the last character,
+`type_line` reads the echoed line back out of the text buffer. When the line on
+screen is not the line asked, the script erases it with `sendkey backspace` and
+types it again, up to three times, and only then sends `sendkey ret`. A loaded
+host can lose a key on the way to the monitor, and a lost key turns one command
+into a different one.
+
 The injected key reaches the queue of the emulated 8042. The status bit on port
 0x64 rises from queue occupancy alone, so the polled driver reads the key with no
 interrupt. This kernel enables no interrupt, and the input path still works.
@@ -479,6 +486,12 @@ The script reads the result out of the VGA text buffer. The monitor command
 `xp/2000hx 0xb8000` dumps 2000 cells as halfwords. The low byte of a cell is the
 character, and the high byte is the colour. The script decodes the low byte and
 rebuilds 25 rows of 80 characters. An assertion then compares exact text.
+
+That dump is the one long reply the script asks for, and it gets two guards.
+The script holds the monitor connection open until the reply goes quiet,
+because hanging up on the monitor in the middle of a reply silences it for the
+rest of the run. And a dump that does not hold all 2000 cells is asked again,
+up to three times.
 
 The previous check compared pixel colours in a screen dump. It could prove that
 white glyphs exist and that the grey text of GRUB is gone, and it could not read

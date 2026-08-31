@@ -192,8 +192,13 @@ over a unix socket. It polls `info registers` until the kernel is reached (up to
 physical memory with `xp`, reads the VGA text buffer at `0xb8000` and decodes
 the character byte of every cell, walks the guest's real page tables with
 `info mem`, types into the guest with `sendkey`, one key per call, because
-`sendkey` has no string form, and pulls the reset line with `system_reset` to
-get a live machine back after a fatal panic has halted the processor. The
+`sendkey` has no string form — then reads the echoed line back out of video
+memory and retypes it if a key went missing — and pulls the reset line with
+`system_reset` to get a live machine back after a fatal panic has halted the
+processor. Long monitor replies (the screen is 20 KB of `xp` output) are
+drained until they go quiet before the connection closes: hanging up on the
+monitor mid-reply wedges it for the rest of the run, which on a loaded host
+used to fail one random assertion per run. The
 assertions of a full `make check`, the first two from the build rules and the
 other thirty-six from the script:
 
