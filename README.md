@@ -343,4 +343,5 @@ Call qemu directly rather than `make run`: `run` depends on the build chain
 (`nasm`, `cargo`, `ld`), which is absent on macOS, so make would fail trying to
 relink before it ever booted anything.
 
+https://claude.ai/code/artifact/98b7b47b-77b2-432b-86c7-f8d912e3897d
 https://claude.ai/code/artifact/8b1c3d49-288d-4e31-b206-9f5f2765cce5
